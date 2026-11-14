@@ -1,0 +1,37 @@
+# gpu — g6e.xlarge = 1x L40S (44 GB). Qwen3.6-27B-FP8 is 28.7 GB of weights,
+# ~13 GB of KV cache. Spot, 1->2 replicas (8-vCPU spot quota / 4 vCPU).
+# g6e.xlarge has only 32 GB of host RAM against 28.7 GB of weights; if loading
+# misbehaves, g6e.2xlarge is the fix at the cost of the whole spot quota.
+tier: gpu
+model: Qwen/Qwen3.6-27B-FP8
+image: docker.io/vllm/vllm-openai:v0.30.0
+gpu:
+  enabled: true
+  count: 1
+args:
+  - --port
+  - "8000"
+  - --max-model-len
+  - "16384"
+  # 0.95+ on 44 GB with 28.7 GB of weights tends to OOM during graph capture.
+  - --gpu-memory-utilization
+  - "0.92"
+  # Qwen3.5+ are multimodal; the vision tower costs VRAM we want for KV cache.
+  - --limit-mm-per-prompt
+  - image=0,video=0
+  - --disable-access-log-for-endpoints
+  - /health,/metrics,/v1/models
+  - --shutdown-timeout
+  - "45"
+resources:
+  cpuRequest: "2"
+  memoryRequest: 16Gi
+  memoryLimit: 24Gi
+capacity:
+  instanceTypes: [g6e.xlarge]
+  capacityTypes: [spot]
+  vcpuLimit: 8
+  diskSizeGb: 200
+autoscaling:
+  minReplicas: 1
+  maxReplicas: 2

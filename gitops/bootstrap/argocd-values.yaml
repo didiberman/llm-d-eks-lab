@@ -1,0 +1,54 @@
+# Argo CD install values — shared by Terraform on EKS (terraform/10-cluster/
+# argocd.tf) and local/argocd-up.sh on kind, so the local proof runs exactly
+# what AWS runs.
+#
+# Lean on purpose: one repo, one root app, no SSO, no notifications, no
+# ApplicationSets. The UI is reached with `make argocd-ui` (port-forward), never
+# exposed publicly.
+
+global:
+  # Platform controllers stay off GPU nodes.
+  nodeSelector:
+    llm-d-eks-lab/role: system
+
+configs:
+  params:
+    # Served over a local port-forward only; TLS would just add a cert warning.
+    server.insecure: true
+  cm:
+    # How often Argo CD polls git. CI also requests a hard refresh after each
+    # push, so a change normally lands within seconds.
+    timeout.reconciliation: 120s
+  repositories:
+    # The llm-d router chart is published as an OCI artifact on ghcr.io.
+    # Argo CD needs the registry declared with enableOCI to pull Helm charts
+    # from it; it is public, so no credentials.
+    llm-d-charts:
+      type: helm
+      name: llm-d-charts
+      url: ghcr.io/llm-d/charts
+      enableOCI: "true"
+
+dex:
+  enabled: false
+notifications:
+  enabled: false
+applicationSet:
+  enabled: false
+
+controller:
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { memory: 1Gi }
+repoServer:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 512Mi }
+server:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+redis:
+  resources:
+    requests: { cpu: 20m, memory: 64Mi }
+    limits: { memory: 128Mi }

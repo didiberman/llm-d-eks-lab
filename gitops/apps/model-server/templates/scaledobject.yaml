@@ -1,0 +1,49 @@
+# Scales the model server on EPP *demand*, not utilisation: a GPU reads ~100%
+# busy whether it is keeping up or drowning, so only queue depth tells you to
+# add capacity. The two triggers race; the larger desired count wins.
+#
+# llm_d_epp_flow_control_queue_size only exists with the EPP's flowControl
+# feature gate (gitops/values/router.yaml). Without it this query is empty and
+# nothing ever scales — with no error anywhere.
+{{- $sel := printf "namespace=%q,service=%q,model_name=%q" .Values.namespace (printf "%s-epp" .Values.release) .Values.model }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Values.release }}-keda-epp
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "ms.decode" . }}
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-{{ .Values.release }}
+      # Sized near the cold-start time, so replicas still loading weights do
+      # not trigger an overshoot followed by a flap.
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.stabilizationSeconds }}
+          policies: [{ type: Percent, value: 100, periodSeconds: 15 }]
+        scaleDown:
+          stabilizationWindowSeconds: {{ .Values.autoscaling.stabilizationSeconds }}
+          policies: [{ type: Percent, value: 100, periodSeconds: 15 }]
+  triggers:
+    - type: prometheus
+      name: epp-queue-size
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ .Values.prometheusAddress }}
+        query: sum(llm_d_epp_flow_control_queue_size{ {{- $sel -}} })
+        threshold: {{ .Values.autoscaling.queueDepthTarget | quote }}
+    - type: prometheus
+      name: epp-running-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ .Values.prometheusAddress }}
+        query: sum(llm_d_epp_request_running{ {{- $sel -}} })
+        threshold: {{ .Values.autoscaling.runningRequestsTarget | quote }}

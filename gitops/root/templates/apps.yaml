@@ -1,0 +1,125 @@
+{{- $tiers := list "none" "sim" "small" "gpu" "kimi" }}
+{{- if not (has .Values.tier $tiers) }}
+{{- fail (printf "tier must be one of %v, got %q" $tiers .Values.tier) }}
+{{- end }}
+{{- if ne .Values.tier "none" }}
+# The llm-d router: Envoy + endpoint picker in front of the model servers.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: llm-d-router
+  {{- include "root.common" . }}
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.namespace }}
+  sources:
+    - repoURL: ghcr.io/llm-d/charts
+      chart: llm-d-router-standalone
+      targetRevision: {{ .Values.versions.router }}
+      helm:
+        # Derived names depend on it: the EPP service is <release>-epp and the
+        # InferencePool is <release>. The model-server chart assumes "llm-d".
+        releaseName: llm-d
+        valueFiles:
+          - $values/gitops/values/router.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  {{- include "root.sync" . }}
+---
+# Capacity + model server + autoscaling + public endpoints for the tier.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: llm-d-model
+  {{- include "root.common" . }}
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.namespace }}
+  source:
+    repoURL: {{ .Values.repoURL }}
+    targetRevision: {{ .Values.targetRevision }}
+    path: gitops/apps/model-server
+    helm:
+      releaseName: llm-d-model
+      valueFiles:
+        - ../../tiers/{{ .Values.tier }}.yaml
+      valuesObject:
+        environment: {{ .Values.environment }}
+        project: {{ .Values.project }}
+        namespace: {{ .Values.namespace }}
+        karpenter:
+          enabled: {{ eq .Values.environment "eks" }}
+          nodeRole: {{ .Values.karpenter.nodeRole | quote }}
+          discoveryTag: {{ .Values.karpenter.discoveryTag }}
+        allowedCidrs: {{ toJson .Values.allowedCidrs }}
+        webui:
+          enabled: {{ .Values.webui.enabled }}
+  # KEDA's HPA owns the replica count; never let a sync reset it.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
+  {{- include "root.sync" . }}
+    syncOptions:
+      - RespectIgnoreDifferences=true
+{{- if .Values.webui.enabled }}
+---
+# Chat UI on top of the router's OpenAI-compatible API.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: open-webui
+  {{- include "root.common" . }}
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.namespace }}
+  sources:
+    - repoURL: https://helm.openwebui.com/
+      chart: open-webui
+      targetRevision: {{ .Values.versions.openWebui }}
+      helm:
+        # The public Service (model-server chart) selects instance=open-webui.
+        releaseName: open-webui
+        valueFiles:
+          - $values/gitops/values/open-webui.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  {{- include "root.sync" . }}
+{{- end }}
+{{- if and (eq .Values.environment "eks") (has .Values.tier .Values.gpuTiers) }}
+---
+# Makes GPU nodes advertise nvidia.com/gpu (missing from the AL2023 AMI).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nvidia-device-plugin
+  {{- include "root.common" . }}
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nvidia-device-plugin
+  sources:
+    - repoURL: https://nvidia.github.io/k8s-device-plugin
+      chart: nvidia-device-plugin
+      targetRevision: {{ .Values.versions.nvidiaDevicePlugin }}
+      helm:
+        valueFiles:
+          - $values/gitops/values/nvidia-device-plugin.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  {{- include "root.sync" . }}
+    syncOptions:
+      - CreateNamespace=true
+{{- end }}
+{{- end }}

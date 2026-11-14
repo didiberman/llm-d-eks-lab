@@ -1,0 +1,58 @@
+# kimi — moonshotai/Kimi-Dev-72B, the largest Kimi that fits this account.
+#
+# 72.7B coding model (Qwen2.5-72B base, MIT, ungated), BF16 only: 145 GB on
+# disk, ~135 GiB in VRAM. Tensor-parallel across the two 96 GB RTX PRO 6000s
+# of a g7e.12xlarge, leaving ~34 GiB of KV cache (~110k tokens).
+#
+# ONE replica, on-demand: the node is 48 vCPU, the on-demand G/VT quota is 64
+# and the spot quota 8. ~$8.29/hr. Measured cold start ~12-15 min.
+#
+# Fallback if g7e misbehaves: g6e.12xlarge (4x L40S, 48 vCPU, $10.49/hr) with
+# gpu.count 4 and --tensor-parallel-size 4.
+tier: kimi
+model: moonshotai/Kimi-Dev-72B
+image: docker.io/vllm/vllm-openai:v0.30.0
+gpu:
+  enabled: true
+  count: 2
+args:
+  - --port
+  - "8000"
+  - --tensor-parallel-size
+  - "2"
+  # Supports 131072, but every token of context is KV cache taken from
+  # concurrent requests. 32k is plenty for a coding lab.
+  - --max-model-len
+  - "32768"
+  - --gpu-memory-utilization
+  - "0.92"
+  # Open WebUI and agent tools send tool_choice "auto"; vLLM rejects it with a
+  # 400 unless tool calling is on. Qwen2.5 fine-tunes emit Hermes tool calls.
+  - --enable-auto-tool-choice
+  - --tool-call-parser
+  - hermes
+  - --disable-access-log-for-endpoints
+  - /health,/metrics,/v1/models
+  - --shutdown-timeout
+  - "45"
+# 48 vCPU / 512 GB node with nothing else on it; the high memory limit is page
+# cache while 145 GB of safetensors stream to the GPUs.
+resources:
+  cpuRequest: "16"
+  memoryRequest: 64Gi
+  memoryLimit: 256Gi
+# Tensor-parallel workers talk over shared memory.
+shmSize: 16Gi
+# 145 GB to download and load: 240 x 10s = 40 minutes.
+startupProbeFailureThreshold: 240
+capacity:
+  instanceTypes: [g7e.12xlarge]
+  capacityTypes: [on-demand]
+  vcpuLimit: 48
+  diskSizeGb: 400
+  # gp3 baseline (125 MB/s) needs ~20 min just to write the weights.
+  diskThroughputMbps: 1000
+  diskIops: 8000
+autoscaling:
+  minReplicas: 1
+  maxReplicas: 1

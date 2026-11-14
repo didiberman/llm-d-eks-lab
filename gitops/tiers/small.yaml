@@ -1,0 +1,34 @@
+# small — a real GPU, a small model. g6.xlarge = 1x L4 (22 GB). Qwen3.5-4B is
+# 8.7 GB of weights, ~11 GB left for KV cache. Spot: two of these fit the
+# 8-vCPU G/VT spot quota, so 1->2 scale-out is observable.
+tier: small
+model: Qwen/Qwen3.5-4B
+image: docker.io/vllm/vllm-openai:v0.30.0
+gpu:
+  enabled: true
+  count: 1
+args:
+  - --port
+  - "8000"
+  - --max-model-len
+  - "16384"
+  - --gpu-memory-utilization
+  - "0.90"
+  - --limit-mm-per-prompt
+  - image=0,video=0
+  - --disable-access-log-for-endpoints
+  - /health,/metrics,/v1/models
+  - --shutdown-timeout
+  - "45"
+resources:
+  cpuRequest: "2"
+  memoryRequest: 8Gi
+  memoryLimit: 12Gi
+capacity:
+  instanceTypes: [g6.xlarge]
+  capacityTypes: [spot]
+  vcpuLimit: 8
+  diskSizeGb: 100
+autoscaling:
+  minReplicas: 1
+  maxReplicas: 2

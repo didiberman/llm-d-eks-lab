@@ -1,0 +1,8 @@
+apiVersion: v2
+name: llm-d-lab-root
+description: >-
+  App of apps. Reads the desired tier from deploy/config.yaml and renders one
+  Argo CD Application per component. tier "none" renders nothing, so Argo CD
+  prunes the whole inference layer and Karpenter returns the nodes.
+type: application
+version: 1.0.0

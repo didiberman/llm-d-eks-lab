@@ -1,0 +1,17 @@
+# Desired state of the lab. Commit + push to change it.
+#
+# cluster  Whether the EKS cluster should exist. CI never creates it while this
+#          is false, so no push can start the ~$0.26/hr base cost by accident.
+#          Tearing down is the manual destroy workflow (or `make destroy`).
+#
+# tier     What Argo CD runs on the cluster:
+#            none   nothing — Argo CD prunes the inference layer, Karpenter
+#                   returns the nodes (cluster stays, ~$0.26/hr)
+#            sim    llm-d-inference-sim, no GPU                   ~$0.03/hr
+#            small  Qwen3.5-4B on g6.xlarge (L4), spot           ~$0.53/hr/replica
+#            gpu    Qwen3.6-27B-FP8 on g6e.xlarge (L40S), spot   ~$1.80/hr/replica
+#            kimi   Kimi-Dev-72B on g7e.12xlarge (2x 96 GB)      ~$8.42/hr
+#
+# The nightly reaper sets tier back to none at 03:00 UTC.
+cluster: false
+tier: none

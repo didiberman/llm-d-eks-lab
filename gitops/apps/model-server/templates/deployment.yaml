@@ -1,0 +1,115 @@
+# The model server behind the llm-d router. Two contracts with the router
+# chart, verified by rendering it — break either and the router has no
+# backends, silently:
+#   1. pods carry  llm-d.ai/inference-pool: <release>   (the pool selector)
+#   2. pods serve on container port 8000                 (hardcoded upstream)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ms.decode" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "ms.labels" . | nindent 4 }}
+spec:
+  # No `replicas`: KEDA's HPA owns the count. Setting it here would make Argo
+  # CD's self-heal reset it on every sync and fight the autoscaler (the app
+  # also ignores /spec/replicas as a belt-and-braces measure).
+  #
+  # Kubernetes' default is 600s, after which the rollout is marked failed while
+  # a large model is still healthy and loading.
+  progressDeadlineSeconds: {{ add (mul .Values.startupProbeFailureThreshold 10) 600 }}
+  selector:
+    matchLabels:
+      {{- include "ms.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One GPU per replica and a hard quota ceiling: surging would ask for a
+      # node that cannot exist, so updates replace in place.
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "ms.labels" . | nindent 8 }}
+    spec:
+      # Must exceed vLLM's --shutdown-timeout so in-flight requests drain.
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        llm-d-eks-lab/role: model-server
+        llm-d-eks-lab/tier: {{ .Values.tier }}
+      {{- if .Values.gpu.enabled }}
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      {{- end }}
+      containers:
+        - name: modelserver
+          image: {{ .Values.image }}
+          {{- if .Values.gpu.enabled }}
+          command: ["vllm", "serve"]
+          args:
+            - {{ .Values.model | quote }}
+            {{- range .Values.args }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- else }}
+          args: ["--model", {{ .Values.model | quote }}, "--port", "8000"]
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  # Created by Terraform (EKS) or local/argocd-up.sh (kind) —
+                  # a secret value cannot live in a public repo.
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            - name: HF_HOME
+              value: /cache/huggingface
+          resources:
+            requests:
+              cpu: {{ .Values.resources.cpuRequest | quote }}
+              memory: {{ .Values.resources.memoryRequest }}
+              {{- if .Values.gpu.enabled }}
+              nvidia.com/gpu: {{ .Values.gpu.count | quote }}
+              {{- end }}
+            limits:
+              memory: {{ .Values.resources.memoryLimit }}
+              {{- if .Values.gpu.enabled }}
+              nvidia.com/gpu: {{ .Values.gpu.count | quote }}
+              {{- end }}
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+            - name: shm
+              mountPath: /dev/shm
+          # failureThreshold x 10s must exceed the worst cold start, or the pod
+          # is killed mid-load and loops forever.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: {{ .Values.startupProbeFailureThreshold }}
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.shmSize }}

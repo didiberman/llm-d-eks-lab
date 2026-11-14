@@ -1,0 +1,31 @@
+# kind cluster for the free GitOps proof (`make argocd-local`).
+#
+# Mirrors the EKS node layout: one worker labelled as a system node (Argo CD,
+# KEDA, Prometheus, Open WebUI land here, as on the EKS system node group) and
+# two labelled as model-server capacity, standing in for the nodes Karpenter
+# would launch. Karpenter itself cannot run here — it provisions EC2.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llm-d-argocd
+
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # NodePorts from the model-server chart's kind mode.
+      - containerPort: 30080   # router (OpenAI API)
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 30081   # Open WebUI
+        hostPort: 8081
+        protocol: TCP
+  - role: worker
+    labels:
+      llm-d-eks-lab/role: system
+  - role: worker
+    labels:
+      llm-d-eks-lab/role: model-server
+      llm-d-eks-lab/tier: sim
+  - role: worker
+    labels:
+      llm-d-eks-lab/role: model-server
+      llm-d-eks-lab/tier: sim

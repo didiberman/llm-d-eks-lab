@@ -1,0 +1,49 @@
+# Open WebUI — a chat front end for whatever model the current tier serves.
+#
+# It talks to the llm-d router's in-cluster OpenAI-compatible API, so every
+# chat goes through the EPP exactly like API traffic does.
+#
+# Deliberately light: no Ollama, Pipelines, Redis or Tika; no persistence (the
+# cluster has no EBS CSI driver, and the reaper wipes the inference layer
+# nightly anyway). Auth is off because the public Service only admits
+# allowedCidrs — the same boundary as the model API, which has no auth either.
+# Widen allowedCidrs and you must set WEBUI_AUTH back to True.
+ollama:
+  enabled: false
+pipelines:
+  enabled: false
+tika:
+  enabled: false
+websocket:
+  enabled: false
+  redis:
+    enabled: false
+persistence:
+  enabled: false
+
+# Router service in the same namespace; port 80 is the Envoy sidecar.
+openaiBaseApiUrl: http://llm-d-epp.llm-d.svc.cluster.local/v1
+# vLLM ignores the key, but Open WebUI refuses an empty one.
+openaiApiKey: unused
+
+extraEnvVars:
+  - name: WEBUI_AUTH
+    value: "False"
+  - name: ENABLE_OLLAMA_API
+    value: "False"
+  # Skip downloading the local embedding model at startup; RAG over uploads is
+  # not what this lab is for.
+  - name: RAG_EMBEDDING_MODEL_AUTO_UPDATE
+    value: "False"
+  - name: ENABLE_RAG_WEB_SEARCH
+    value: "False"
+
+nodeSelector:
+  llm-d-eks-lab/role: system
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 2Gi

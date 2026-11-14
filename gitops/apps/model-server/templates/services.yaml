@@ -1,0 +1,64 @@
+# Public endpoints for the router (OpenAI API) and Open WebUI.
+#
+# EKS: internet-facing NLBs via the controller built into EKS (the AWS Load
+#      Balancer Controller is not installed, so its `external` annotations
+#      would leave the Service pending forever). Source ranges become node
+#      security-group rules; they come from the root app, never from git.
+# kind: NodePorts mapped to localhost by local/kind-argocd.yaml.
+{{- $eks := eq .Values.environment "eks" }}
+{{- if and $eks (not .Values.allowedCidrs) }}
+{{- fail "allowedCidrs is empty — refusing to put unauthenticated endpoints on the internet" }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.release }}-public
+  namespace: {{ .Values.namespace }}
+  {{- if $eks }}
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  {{- end }}
+spec:
+  type: {{ if $eks }}LoadBalancer{{ else }}NodePort{{ end }}
+  selector:
+    # The router chart's pods (verified by rendering it).
+    llm-d-router-gateway: {{ .Values.release }}-epp
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8081   # the Envoy sidecar's listener
+      protocol: TCP
+      {{- if not $eks }}
+      nodePort: 30080
+      {{- end }}
+  {{- if $eks }}
+  loadBalancerSourceRanges: {{ toJson .Values.allowedCidrs }}
+  {{- end }}
+{{- if .Values.webui.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui-public
+  namespace: {{ .Values.namespace }}
+  {{- if $eks }}
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  {{- end }}
+spec:
+  type: {{ if $eks }}LoadBalancer{{ else }}NodePort{{ end }}
+  selector:
+    app.kubernetes.io/instance: open-webui
+    app.kubernetes.io/component: open-webui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+      {{- if not $eks }}
+      nodePort: 30081
+      {{- end }}
+  {{- if $eks }}
+  loadBalancerSourceRanges: {{ toJson .Values.allowedCidrs }}
+  {{- end }}
+{{- end }}
