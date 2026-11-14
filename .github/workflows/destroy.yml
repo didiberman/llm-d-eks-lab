@@ -98,7 +98,7 @@ jobs:
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "No EKS cluster found — skipping the Terraform destroys, sweeping only."
+            echo "No EKS cluster found — skipping 20-inference; 10-cluster is still destroyed if its state holds anything (e.g. a VPC left by a failed run)."
           fi
 
       - name: Destroy 20-inference
@@ -130,13 +130,49 @@ jobs:
           done
           echo "::warning::Load balancers or Karpenter nodes still present after 10 minutes — continuing; the sweep step will report them."
 
+      # The VPC CNI attaches extra "aws-K8S-<instance>" ENIs to every node and
+      # normally deletes them when the node goes. If the cluster disappears
+      # first they are left detached ("available") in a subnet, holding the
+      # subnet and the node security group, and the VPC destroy fails with
+      # DependencyViolation after a 20-minute retry loop. Delete them first.
+      - name: Sweep leaked VPC CNI network interfaces
+        run: |
+          set -euo pipefail
+          vpc=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${CLUSTER}" --query 'Vpcs[0].VpcId' --output text)
+          [ "$vpc" = "None" ] && { echo "No project VPC."; exit 0; }
+          for id in $(aws ec2 describe-network-interfaces               --filters "Name=vpc-id,Values=${vpc}" "Name=status,Values=available" "Name=description,Values=aws-K8S-*"               --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+            echo "Deleting leaked CNI interface $id"
+            aws ec2 delete-network-interface --network-interface-id "$id"
+          done
+
+      # Not gated on the cluster existing: a previous run can die after the
+      # cluster is gone but before the VPC is, and that VPC must still go.
       - name: Destroy 10-cluster
-        if: steps.cluster.outputs.exists == 'true'
         working-directory: terraform/10-cluster
         run: |
+          set -uo pipefail
           terraform init -no-color \
             -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
             -backend-config="region=${AWS_REGION}"
+          if [ -z "$(terraform state list 2>/dev/null)" ]; then
+            echo "10-cluster state is empty — nothing to destroy."
+            exit 0
+          fi
+          terraform destroy -no-color -auto-approve && exit 0
+
+          # Most likely an ENI that only became "available" after its node
+          # finished terminating. Sweep again and retry once.
+          echo "::warning::10-cluster destroy failed — sweeping leaked ENIs and retrying once."
+          vpc=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${CLUSTER}" --query 'Vpcs[0].VpcId' --output text)
+          if [ "$vpc" != "None" ]; then
+            sleep 60
+            for id in $(aws ec2 describe-network-interfaces \
+                --filters "Name=vpc-id,Values=${vpc}" "Name=status,Values=available" "Name=description,Values=aws-K8S-*" \
+                --query 'NetworkInterfaces[].NetworkInterfaceId' --output text); do
+              echo "Deleting leaked CNI interface $id"
+              aws ec2 delete-network-interface --network-interface-id "$id"
+            done
+          fi
           terraform destroy -no-color -auto-approve
 
       # Karpenter terminates its nodes when a NodePool is deleted, but if the
