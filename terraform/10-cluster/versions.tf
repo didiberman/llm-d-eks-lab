@@ -26,6 +26,13 @@ terraform {
       source  = "hashicorp/null"
       version = "~> 3.2"
     }
+    # For the root Argo CD Application: hashicorp/kubernetes' kubernetes_manifest
+    # needs the CRD to exist at *plan* time, which a from-scratch apply (Argo CD
+    # installed in the same run) cannot satisfy. This provider applies raw YAML.
+    kubectl = {
+      source  = "alekc/kubectl"
+      version = "~> 2.1"
+    }
   }
 }
 
@@ -62,5 +69,18 @@ provider "helm" {
       command     = "aws"
       args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
     }
+  }
+}
+
+provider "kubectl" {
+  host                   = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  load_config_file       = false
+  apply_retry_count      = 3
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "aws"
+    args        = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.region]
   }
 }

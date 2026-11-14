@@ -3,22 +3,22 @@
 # Actions → destroy → Run workflow, type "destroy" to confirm.
 #
 # Order matters:
-#   1. 20-inference  model server, router, Open WebUI, NodePools. Deleting the
-#                    NodePool makes Karpenter terminate the GPU nodes; deleting
-#                    the Services makes EKS delete their NLBs (asynchronously).
+#   1. Argo CD apps  delete the root Application. Its finalizer cascades through
+#                    every child app: NodePools go (Karpenter terminates the
+#                    GPU nodes) and the public Services go (EKS deletes their
+#                    NLBs, asynchronously).
 #   2. wait          for those NLBs and Karpenter nodes to actually disappear.
 #                    A leftover NLB holds ENIs and a security group in the VPC
 #                    and makes step 3 fail with DependencyViolation.
-#   3. 10-cluster    EKS, Karpenter controller, KEDA, Prometheus, VPC.
-#   4. sweep         terminate any Karpenter instance that outlived its
-#                    controller, then fail loudly if anything still bills.
+#   3. 10-cluster    Argo CD, EKS, Karpenter, KEDA, Prometheus, VPC.
+#   4. sweep         leaked CNI interfaces and orphaned Karpenter instances,
+#                    then fail loudly if anything still bills.
 #
 # Left in place on purpose (~$0): 00-bootstrap — the S3 state bucket
 # (prevent_destroy) and the GitHub OIDC roles this workflow itself uses.
 #
-# deploy/tier is NOT changed. The next push touching deploy/, terraform/ or
-# manifests/router/ recreates the cluster and that tier — set deploy/tier to
-# "none" first if you want it to stay down.
+# deploy/config.yaml is NOT changed. Set `cluster: false` too, or the next push
+# under terraform/10-cluster/ recreates the cluster.
 name: destroy
 
 on:
@@ -82,7 +82,6 @@ jobs:
           {
             echo "TF_VAR_region=$AWS_REGION"
             echo "TF_VAR_project=$CLUSTER"
-            echo "TF_VAR_state_bucket=${{ vars.STATE_BUCKET }}"
             echo "TF_VAR_deploy_role_arn=$DEPLOY_ROLE_ARN"
             [ -n "$REAPER_ROLE_ARN" ] && echo "TF_VAR_reaper_role_arn=$REAPER_ROLE_ARN"
             [ -n "$ADMIN_PRINCIPAL_ARN" ] && echo "TF_VAR_admin_principal_arn=$ADMIN_PRINCIPAL_ARN"
@@ -98,17 +97,25 @@ jobs:
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "No EKS cluster found — skipping 20-inference; 10-cluster is still destroyed if its state holds anything (e.g. a VPC left by a failed run)."
+            echo "No EKS cluster found — skipping the Argo CD teardown; 10-cluster is still destroyed if its state holds anything (e.g. a VPC left by a failed run)."
           fi
 
-      - name: Destroy 20-inference
+      # Deleting the root app (foreground) cascades through every child app
+      # and what they deployed, thanks to the resources finalizers. Terraform
+      # would otherwise uninstall Argo CD first and orphan the NLBs and nodes.
+      - name: Delete the Argo CD apps (cascades to NodePools, NLBs, workloads)
         if: steps.cluster.outputs.exists == 'true'
-        working-directory: terraform/20-inference
         run: |
-          terraform init -no-color \
-            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
-            -backend-config="region=${AWS_REGION}"
-          terraform destroy -no-color -auto-approve
+          set -uo pipefail
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER" >/dev/null
+          if kubectl -n argocd get application root >/dev/null 2>&1; then
+            kubectl -n argocd delete application root --cascade=foreground --wait=true --timeout=15m \
+              || echo "::warning::Root app deletion did not finish in 15 minutes — falling back to direct deletes."
+          fi
+          # Backstop, in case Argo CD itself is broken.
+          kubectl -n argocd delete applications.argoproj.io --all --wait=false 2>/dev/null || true
+          kubectl delete nodepools.karpenter.sh --all --wait=false 2>/dev/null || true
+          kubectl -n llm-d delete service --field-selector spec.type=LoadBalancer --wait=false 2>/dev/null || true
 
       - name: Wait for Kubernetes-created load balancers and GPU nodes to go
         if: steps.cluster.outputs.exists == 'true'
@@ -221,7 +228,7 @@ jobs:
             echo "| Project VPCs | $vpcs |"
             echo ""
             echo "Left on purpose: S3 state bucket and GitHub OIDC roles (00-bootstrap, ~\$0)."
-            echo "deploy/tier is unchanged — set it to \`none\` before your next infra push to stay down."
+            echo "deploy/config.yaml is unchanged — set \`cluster: false\` or the next push under terraform/10-cluster/ recreates it."
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
           total=$((clusters + instances + karp + lbs + nats + vpcs))

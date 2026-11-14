@@ -52,10 +52,4 @@ terraform.tfvars
 *.swp
 *.swo
 *~
-
-# The tier definitions ARE the configuration and carry no secrets — they must
-# be committed. The blanket *.tfvars rule above (from GitHub's Terraform
-# template) would otherwise silently drop them and `make gpu` would fail on a
-# fresh clone with a missing var-file.
-!terraform/20-inference/tiers/*.tfvars
 .logs/

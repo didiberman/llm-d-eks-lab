@@ -157,3 +157,49 @@ variable "deploy_role_arn" {
   type        = string
   default     = null
 }
+
+# ---------------------------------------------------------------------------
+# GitOps (Argo CD). Terraform installs Argo CD and one root Application; the
+# inference layer itself is reconciled from gitops/ in this repo.
+# ---------------------------------------------------------------------------
+
+variable "argocd_chart_version" {
+  description = "argo-cd Helm chart version (https://argoproj.github.io/argo-helm). Keep aligned with local/argocd-up.sh."
+  type        = string
+  default     = "10.18.0"
+
+  nullable = false
+}
+
+variable "gitops_repo_url" {
+  description = "Git repository Argo CD reconciles from. Must be readable without credentials (public)."
+  type        = string
+  default     = "https://github.com/didiberman/llm-d-eks-lab.git"
+
+  nullable = false
+}
+
+variable "gitops_revision" {
+  description = "Branch, tag or commit Argo CD tracks."
+  type        = string
+  default     = "main"
+
+  nullable = false
+}
+
+variable "allowed_cidrs" {
+  description = "CIDRs allowed to reach the public endpoints (model API, Open WebUI). Injected into the root Application, never committed to git. The model-server chart refuses to render on EKS if this is empty."
+  type        = list(string)
+  default     = []
+
+  nullable = false
+}
+
+variable "hf_token" {
+  description = "HuggingFace token, stored as the llm-d-hf-token Secret the model server reads. Optional for ungated models. Set via TF_VAR_hf_token; never commit it."
+  type        = string
+  default     = ""
+  sensitive   = true
+
+  nullable = false
+}

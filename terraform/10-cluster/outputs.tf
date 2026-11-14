@@ -1,5 +1,5 @@
 output "cluster_name" {
-  description = "EKS cluster name. 20-inference reads this from remote state."
+  description = "EKS cluster name."
   value       = module.eks.cluster_name
 }
 
@@ -15,7 +15,7 @@ output "cluster_certificate_authority_data" {
 }
 
 output "oidc_provider_arn" {
-  description = "IRSA OIDC provider ARN, for service accounts created in 20-inference."
+  description = "IRSA OIDC provider ARN."
   value       = module.eks.oidc_provider_arn
 }
 
@@ -30,12 +30,12 @@ output "vpc_id" {
 }
 
 output "public_subnet_ids" {
-  description = "Public subnets. The Karpenter EC2NodeClass in 20-inference places GPU nodes here."
+  description = "Public subnets, discovered by Karpenter EC2NodeClasses via the karpenter.sh/discovery tag."
   value       = module.vpc.public_subnets
 }
 
 output "karpenter_node_iam_role_name" {
-  description = "IAM role the EC2NodeClass in 20-inference assigns to GPU nodes."
+  description = "IAM role Karpenter EC2NodeClasses assign to nodes; injected into the root Argo CD app."
   value       = module.karpenter.node_iam_role_name
 }
 
@@ -52,4 +52,9 @@ output "kubeconfig_command" {
 output "nat_gateway_count" {
   description = "Always 0. Asserted as an output so a regression is visible in the plan diff rather than only on the bill."
   value       = 0
+}
+
+output "argocd_ui_command" {
+  description = "Open the Argo CD UI (user admin; password from the argocd-initial-admin-secret Secret)."
+  value       = "kubectl -n argocd port-forward svc/argocd-server 8090:80   # then http://localhost:8090"
 }

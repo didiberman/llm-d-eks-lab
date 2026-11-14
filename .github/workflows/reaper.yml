@@ -1,62 +1,75 @@
-# Nightly reaper — the highest-value cost guardrail in this repo.
+# Nightly reaper — the cost guardrail that stops a forgotten GPU billing for a
+# week (a Kimi node is ~$200/day).
 #
-# Destroys the inference layer every night regardless of state, so a forgotten
-# GPU node cannot bill for a week. A g6e.xlarge left running is ~$44/day; a
-# g6e.24xlarge is ~$97/day.
+# With Argo CD reconciling the cluster from git, deleting resources directly
+# would just be undone on the next sync. So the reaper changes the desired
+# state instead:
 #
-# Only touches 20-inference. The cluster itself ($0.185/hr) is left alone so a
-# session interrupted at midnight can resume in four minutes rather than
-# sixteen. Set reap_cluster to also take out 10-cluster.
+#   1. commit `tier: none` to deploy/config.yaml        (git is the source of truth)
+#   2. ask Argo CD to refresh                           (it prunes the inference
+#      layer; deleting the NodePool makes Karpenter terminate its nodes)
+#   3. wait for the NodePools and Karpenter instances to be gone
+#   4. backstop: if any survive, delete NodePools and terminate the instances
+#      directly, then fail loudly
 #
-# SETUP (the workflow no-ops safely until these exist):
-#   1. terraform/00-bootstrap with github_repo = "didiberman/llm-d-eks-lab"
-#   2. Repo secret AWS_REAPER_ROLE_ARN = the github_reaper_role_arn output
-#   3. Repo variable STATE_BUCKET      = the state_bucket output
+# The cluster itself (~$0.26/hr) is left up; tear it down with the destroy
+# workflow. To bring the model back, set the tier again and push.
 name: reaper
 
 on:
   schedule:
-    # 03:00 UTC daily. Cron in GitHub Actions is best-effort and can be delayed
-    # by up to ~an hour under load, which is fine for a backstop.
+    # 03:00 UTC daily. GitHub cron is best-effort and can run up to ~1h late.
     - cron: "0 3 * * *"
   workflow_dispatch:
-    inputs:
-      reap_cluster:
-        description: "Also destroy 10-cluster (full teardown to $0.00/hr)"
-        type: boolean
-        default: false
 
 permissions:
-  id-token: write # required for OIDC
-  contents: read
+  id-token: write # OIDC
+  contents: write # commit tier: none
 
-# Shared with the deploy workflow so a teardown never races an apply for the
-# same state lock.
+# Shared with deploy and destroy.
 concurrency:
   group: aws-llm-d-eks-lab
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-2
-  TF_IN_AUTOMATION: "1"
+  CLUSTER: llm-d-eks-lab
 
 jobs:
   reap:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Check the reaper is configured
+      - uses: actions/checkout@v7
+
+      - name: Set tier none in git
+        id: git
+        run: |
+          set -euo pipefail
+          tier=$(awk '/^tier:/{print $2}' deploy/config.yaml)
+          echo "tier was: $tier"
+          if [ "$tier" = none ]; then
+            echo "Already none — nothing to commit."
+            exit 0
+          fi
+          sed -i 's/^tier: .*/tier: none/' deploy/config.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "reaper: set tier none (was $tier)"
+          # GITHUB_TOKEN pushes do not trigger other workflows — Argo CD picks
+          # the change up from git directly.
+          git push
+          echo "reaped=$tier" >> "$GITHUB_OUTPUT"
+
+      - name: Check the reaper role is configured
         id: guard
         run: |
-          if [ -z "${{ secrets.AWS_REAPER_ROLE_ARN }}" ] || [ -z "${{ vars.STATE_BUCKET }}" ]; then
+          if [ -z "${{ secrets.AWS_REAPER_ROLE_ARN }}" ]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Reaper not configured::Set the AWS_REAPER_ROLE_ARN secret and STATE_BUCKET variable. Skipping — GPUs are NOT being reaped."
+            echo "::warning title=Reaper not configured::Set the AWS_REAPER_ROLE_ARN secret. Git now says tier none, but GPU instances are not being verified."
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
-
-      - uses: actions/checkout@v7
-        if: steps.guard.outputs.configured == 'true'
 
       - uses: aws-actions/configure-aws-credentials@v6
         if: steps.guard.outputs.configured == 'true'
@@ -68,75 +81,61 @@ jobs:
         if: steps.guard.outputs.configured == 'true'
         run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
 
-      - uses: hashicorp/setup-terraform@v4
+      - name: Wait for Argo CD to prune the inference layer
         if: steps.guard.outputs.configured == 'true'
-        with:
-          terraform_version: "1.13.4"
-          terraform_wrapper: false
-
-      # If there is no cluster there is nothing to pay for, and `terraform
-      # destroy` against a missing cluster fails on provider setup rather than
-      # succeeding trivially.
-      - name: Is anything actually running?
-        if: steps.guard.outputs.configured == 'true'
-        id: running
+        id: prune
         run: |
-          clusters=$(aws eks list-clusters --region "$AWS_REGION" --query 'length(clusters)' --output text)
-          echo "clusters=$clusters" >> "$GITHUB_OUTPUT"
-          echo "Found $clusters EKS cluster(s)."
+          set -uo pipefail
+          if ! aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+            echo "No cluster — nothing running to reap."
+            exit 0
+          fi
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER" >/dev/null
+          kubectl -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null || true
+          for i in $(seq 1 60); do
+            pools=$(kubectl get nodepools.karpenter.sh --no-headers 2>/dev/null | grep -c . || true)
+            nodes=$(aws ec2 describe-instances \
+              --filters "Name=tag-key,Values=karpenter.sh/nodepool" "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
+                        "Name=instance-state-name,Values=pending,running,stopping" \
+              --query 'length(Reservations[].Instances[])' --output text)
+            echo "nodepools=$pools karpenter instances=$nodes"
+            if [ "$pools" = 0 ] && [ "$nodes" = 0 ]; then echo "Inference layer pruned."; exit 0; fi
+            sleep 15
+          done
+          echo "::warning::Argo CD did not prune everything within 15 minutes — using the backstop."
+          echo "stuck=true" >> "$GITHUB_OUTPUT"
 
-      - name: Destroy the inference layer
-        if: steps.guard.outputs.configured == 'true' && steps.running.outputs.clusters != '0'
-        working-directory: terraform/20-inference
+      # Argo CD might be broken — the very situation a guardrail exists for.
+      # Remove capacity directly; with git already at tier none, Argo CD will
+      # not put it back.
+      - name: Backstop — delete NodePools and terminate Karpenter instances
+        if: steps.prune.outputs.stuck == 'true'
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
-            -backend-config="region=${AWS_REGION}"
-          # -refresh=false would be faster but we specifically want to notice
-          # resources that drifted, since those are the ones still billing.
-          terraform destroy -input=false -auto-approve \
-            -var "region=${AWS_REGION}" \
-            -var "state_bucket=${{ vars.STATE_BUCKET }}"
+          kubectl delete nodepools.karpenter.sh --all --wait=false || true
+          ids=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodepool" "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
+                      "Name=instance-state-name,Values=pending,running,stopping" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -n "$ids" ]; then aws ec2 terminate-instances --instance-ids $ids >/dev/null; echo "Terminated: $ids"; fi
 
-      - name: Destroy the cluster too
-        if: >-
-          steps.guard.outputs.configured == 'true' &&
-          steps.running.outputs.clusters != '0' &&
-          inputs.reap_cluster
-        working-directory: terraform/10-cluster
+      - name: Report
+        if: always()
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
-            -backend-config="region=${AWS_REGION}"
-          terraform destroy -input=false -auto-approve -var "region=${AWS_REGION}"
-
-      # Runs even if destroy failed — a failed teardown is exactly when you
-      # most need to know what is still costing money.
-      - name: Report what is still billing
-        if: always() && steps.guard.outputs.configured == 'true'
-        run: |
-          echo "### Reaper report" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "EKS clusters:" >> "$GITHUB_STEP_SUMMARY"
-          aws eks list-clusters --region "$AWS_REGION" --query clusters --output text >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-          echo "Running instances:" >> "$GITHUB_STEP_SUMMARY"
-          aws ec2 describe-instances --region "$AWS_REGION" \
-            --filters Name=instance-state-name,Values=running,pending \
-            --query 'Reservations[].Instances[].[InstanceType,InstanceId]' --output text >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-          echo "Load balancers:" >> "$GITHUB_STEP_SUMMARY"
-          aws elbv2 describe-load-balancers --region "$AWS_REGION" \
-            --query 'LoadBalancers[].LoadBalancerName' --output text >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Reaper report"
+            echo "- tier before: ${{ steps.git.outputs.reaped || 'none (already)' }}"
+            echo "- Argo CD pruned in time: ${{ steps.prune.outputs.stuck == 'true' && 'no — backstop used' || 'yes' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail loudly if GPU instances survived
         if: always() && steps.guard.outputs.configured == 'true'
         run: |
           gpus=$(aws ec2 describe-instances --region "$AWS_REGION" \
-            --filters Name=instance-state-name,Values=running,pending \
+            --filters Name=instance-state-name,Values=pending,running \
             --query "Reservations[].Instances[?starts_with(InstanceType,'g') || starts_with(InstanceType,'p')].InstanceId" \
             --output text)
           if [ -n "$gpus" ]; then
-            echo "::error title=GPU instances still running::$gpus — the reaper did not clean these up."
+            echo "::error title=GPU instances still running::$gpus"
             exit 1
           fi
           echo "No GPU instances running."

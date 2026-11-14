@@ -48,6 +48,11 @@ else
 fi
 kubectl config use-context "kind-${CLUSTER}" >/dev/null
 
+if [ "${PREPULL:-1}" = 1 ]; then
+  step "Pre-pulling images on the host and loading them into kind (PREPULL=0 to skip)"
+  ./local/kind-prepull.sh "$CLUSTER"
+fi
+
 step "Gateway API ($GATEWAY_API_VERSION) and Inference Extension ($GAIE_VERSION) CRDs"
 kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml" >/dev/null
 kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${GAIE_VERSION}/v1-manifests.yaml" >/dev/null
@@ -59,7 +64,7 @@ helm repo update kedacore prometheus-community argo >/dev/null
 
 step "KEDA ($KEDA_VERSION)"
 helm upgrade --install keda kedacore/keda -n keda --create-namespace --version "$KEDA_VERSION" \
-  --set nodeSelector."llm-d-eks-lab/role"=system --wait --timeout 5m >/dev/null
+  --set nodeSelector."llm-d-eks-lab/role"=system --wait --timeout 15m >/dev/null
 
 # Release name and namespace are what the ScaledObject queries:
 #   llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc:9090
@@ -76,11 +81,11 @@ helm upgrade --install llmd prometheus-community/kube-prometheus-stack -n llm-d-
   --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
   --set prometheus.prometheusSpec.scrapeInterval=15s \
   --set prometheus.prometheusSpec.retention=2h \
-  --wait --timeout 10m >/dev/null
+  --wait --timeout 15m >/dev/null
 
 step "Argo CD ($ARGOCD_VERSION) — same values file Terraform uses on EKS"
 helm upgrade --install argocd argo/argo-cd -n argocd --create-namespace --version "$ARGOCD_VERSION" \
-  -f gitops/bootstrap/argocd-values.yaml --wait --timeout 10m >/dev/null
+  -f gitops/bootstrap/argocd-values.yaml --wait --timeout 15m >/dev/null
 
 step "Namespace and HF token secret (Terraform's job on EKS — secrets never live in git)"
 kubectl create namespace llm-d --dry-run=client -o yaml | kubectl apply -f - >/dev/null

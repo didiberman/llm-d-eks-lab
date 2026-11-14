@@ -1,12 +1,12 @@
 # Karpenter: the piece that makes GPU cost collapse to zero when idle.
 #
-# The controller lives here in 10-cluster; the NodePool and EC2NodeClass that
-# actually describe GPU nodes live in 20-inference, so `make down` removes the
-# ability to create GPUs without tearing down the cluster.
+# The controller lives here; the NodePool and EC2NodeClass that describe GPU
+# nodes are part of the inference layer Argo CD manages (gitops/apps/
+# model-server), so tier: none removes the ability to create GPUs without
+# touching the cluster.
 #
-# `consolidationPolicy: WhenEmptyOrUnderutilized` (set on the NodePool in
-# 20-inference) is what reclaims a GPU node roughly a minute after the last pod
-# leaves it.
+# `consolidationPolicy: WhenEmptyOrUnderutilized` (set on that NodePool) is
+# what reclaims a GPU node roughly a minute after the last pod leaves it.
 
 module "karpenter" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"

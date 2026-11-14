@@ -1,5 +1,5 @@
 output "state_bucket" {
-  description = "S3 bucket holding remote state. Feed this to the 10-cluster and 20-inference backend blocks."
+  description = "S3 bucket holding remote state. Feed this to the 10-cluster backend block."
   value       = aws_s3_bucket.this.id
 }
 

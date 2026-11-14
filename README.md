@@ -2,19 +2,22 @@
 
 A learning lab: [llm-d](https://llm-d.ai) **v1.0.0** serving open-weights models
 on EKS, autoscaled on **inference queue depth** (not CPU), with GPU nodes that
-appear when needed and disappear when idle. Terraform end to end, deployed
-**only** through GitHub Actions with OIDC — `git push` is the deploy button.
+appear when needed and disappear when idle. **Terraform + GitHub Actions** build
+the infrastructure; **Argo CD** runs everything on the cluster from git. A
+`git push` is the only deploy button.
 
 It is not "production grade." It is a practice environment where a real 72B
 model costs about **$8.70/hour** while you use it and **nothing** once it is
 reaped, with guardrails so a forgotten GPU cannot bill you for a week.
 
 ```
- git push ─▶ GitHub Actions (OIDC) ─▶ Terraform ─▶ EKS
-                                                   ├─ llm-d router + endpoint picker
-                                                   ├─ vLLM serving the model (KEDA-scaled)
-                                                   ├─ Karpenter: GPU nodes on demand
-                                                   └─ Open WebUI: chat in your browser
+ git push ─┬─▶ GitHub Actions (OIDC) ─▶ Terraform ─▶ VPC, EKS, IAM, Karpenter,
+           │                                         KEDA, Prometheus, Argo CD
+           │
+           └─▶ Argo CD (pulls from git) ───────────▶ llm-d router + endpoint picker
+                                                     vLLM model server (KEDA-scaled)
+                                                     Karpenter NodePool (GPU nodes on demand)
+                                                     Open WebUI · NVIDIA device plugin
 ```
 
 > **New to LLM serving or Kubernetes?** Start with
@@ -28,6 +31,7 @@ reaped, with guardrails so a forgotten GPU cannot bill you for a week.
 - [Quick start](#quick-start)
 - [Tiers](#tiers)
 - [How deploys work](#how-deploys-work)
+- [Why Argo CD](#why-argo-cd)
 - [Using the model](#using-the-model)
 - [Costs](#costs)
 - [Guardrails](#guardrails)
@@ -43,39 +47,37 @@ reaped, with guardrails so a forgotten GPU cannot bill you for a week.
 
 ## Quick start
 
-Assuming the one-time setup is done ([below](#setting-it-up-in-your-own-account)):
+Everything is driven by one file, [`deploy/config.yaml`](deploy/config.yaml):
 
-```bash
-# Pick what should be running, then push. CI does the rest.
-echo kimi > deploy/tier          # none | sim | small | gpu | kimi
-git commit -am "Run Kimi" && git push
-
-# Or run a tier once without committing:
-make deploy TIER=sim
-
-# Point kubectl at the cluster:
-make kubeconfig
-
-# Stop paying for GPUs (cluster stays up, ~$0.26/hr):
-echo none > deploy/tier && git commit -am "Stop" && git push
-
-# Tear down everything billable (CI, asks you to type "destroy"):
-make destroy        # or Actions → destroy → Run workflow
+```yaml
+cluster: false   # may CI create the EKS cluster?
+tier: none       # none | sim | small | gpu | kimi — what Argo CD runs on it
 ```
 
-The deploy run's summary page prints the model endpoint and the Open WebUI URL.
+Change it, push it, and CI + Argo CD converge on it. The Makefile wraps the
+edit-commit-push:
 
-Want to see the whole stack for free first? `make sim-local` runs router, EPP,
-KEDA, Prometheus and the ScaledObject on a local kind cluster against a vLLM
-simulator. **$0.00.**
+```bash
+make cluster-on            # cluster: true  -> CI builds EKS + Argo CD (~20 min, ~$0.26/hr)
+make tier TIER=kimi        # tier: kimi     -> Argo CD deploys Kimi-Dev-72B
+make follow                # watch CI wait for Argo CD and smoke-test the model
+make kubeconfig            # kubectl access; `make argocd-ui` for the Argo CD UI
+
+make tier TIER=none        # GPUs gone, cluster stays (~$0.26/hr)
+make cluster-off && make destroy   # everything billable gone (~$0)
+```
+
+**Try it for free first.** `make argocd-local` builds the same stack on a local
+kind cluster — the same Argo CD install and root app, syncing this repo from
+GitHub — against a vLLM simulator. **$0.00.**
 
 ---
 
 ## Tiers
 
-Every tier is the same Terraform with a different file in
-`terraform/20-inference/tiers/`. Which one runs is set by
-[`deploy/tier`](deploy/tier).
+Every tier is the same Helm chart (`gitops/apps/model-server`) with a different
+values file in [`gitops/tiers/`](gitops/tiers). Which one runs is the `tier` key
+in [`deploy/config.yaml`](deploy/config.yaml).
 
 | Tier | Model | Hardware | Capacity | Replicas | ~$/hr while up* |
 |------|-------|----------|----------|----------|------------------|
@@ -116,36 +118,70 @@ Measured on the first deploy:
 
 ## How deploys work
 
-Every deploy runs in GitHub Actions (`.github/workflows/deploy.yml`) under an
-IAM role assumed via OIDC — no AWS keys are stored anywhere. Nothing is applied
-from a workstation.
+Two reconcilers, each owning what it is good at:
 
 ```
 push to main
    │
-   ├─ scope      which layers changed? which tier does deploy/tier ask for?
+   ├─ terraform/10-cluster/** or deploy/config.yaml changed
+   │     └─ CI: terraform plan → apply only if non-empty        (never while cluster: false)
+   │        EKS, VPC, IAM, Karpenter, KEDA, Prometheus, Argo CD + the root Application
    │
-   ├─ cluster    only if terraform/10-cluster/** changed
-   │             plan → apply only if the plan is non-empty
-   │
-   └─ inference  if terraform/20-inference/**, manifests/router/** or deploy/** changed
-                 plan → apply only if non-empty → smoke test a completion
+   └─ gitops/** or deploy/** changed
+         └─ Argo CD notices the commit and syncs the cluster to it
+            CI (verify job) requests a refresh, waits until every app is
+            Synced + Healthy, then smoke-tests a completion through the router
 ```
 
-- **Docs never deploy.** README, `docs/` and other non-infra pushes trigger
-  nothing; `validate` also skips docs-only pushes.
-- **No pointless applies.** Each layer is planned with `-detailed-exitcode` and
-  applied only when something actually changes.
-- **Smoke test.** After an apply, CI port-forwards to the router and requires a
-  real completion from the served model.
-- **One at a time.** Deploy and the nightly reaper share a concurrency group,
-  so a teardown never races an apply for the state lock.
-- **Manual runs.** `make deploy TIER=<tier>` (or the *Run workflow* button)
-  overrides `deploy/tier` for a single run.
+- **No pointless applies.** Terraform runs only for infra changes and applies
+  only non-empty plans. Docs and README pushes trigger nothing.
+- **No accidental spend.** While `cluster: false`, CI creates nothing — no push
+  can start the $0.26/hr base cost by mistake.
+- **Drift is impossible to keep.** Argo CD self-heals: a `kubectl edit` on the
+  cluster is reverted to what git says.
+- **One at a time.** Deploy, reaper and destroy share a concurrency group.
+- **Credentials.** GitHub Actions assumes IAM roles via OIDC (no stored AWS
+  keys). Argo CD pulls the public repo and needs no credentials at all.
 
-The local `make cluster`, `make gpu`, `make kimi` … targets refuse to run
-without `ALLOW_LOCAL=1` (break-glass only). `make down` and `make nuke` still
-work locally as an emergency stop.
+`make cluster-apply-local` is the only local apply and requires
+`ALLOW_LOCAL=1` (break-glass). `00-bootstrap` is applied by hand because it
+creates the role CI uses.
+
+---
+
+## Why Argo CD
+
+The first version applied the inference layer with Terraform from CI. It worked,
+but most of its failures came from Terraform waiting on Kubernetes: a 10-minute
+rollout deadline while a 145 GB model was still loading, an orphaned Deployment
+blocking a re-apply, a 50-minute rollout wait holding the state lock. Splitting
+the responsibilities fixes that class of problem:
+
+| | Terraform + GitHub Actions | Argo CD |
+|---|---|---|
+| Owns | VPC, EKS, IAM, access entries, Karpenter controller, KEDA, Prometheus, Argo CD itself | llm-d router, model server, NodePool + EC2NodeClass, ScaledObject, public Services, Open WebUI, NVIDIA plugin |
+| Changes | rarely | constantly |
+| How | push → plan → apply | push → Argo CD syncs (asynchronously) |
+| Why | needs AWS identities and values that must not be in git | pure Kubernetes; benefits from self-heal, pruning and a UI |
+
+How the hard parts were solved:
+
+- **Secrets and private values never enter git.** Terraform writes them where
+  Argo CD can use them: the HuggingFace token as a Kubernetes Secret, and the
+  IP allowlist plus the Karpenter node IAM role as `valuesObject` on the root
+  Application it creates. The repo is public; none of these are in it.
+- **The reaper no longer fights the reconciler.** Deleting resources would just
+  be undone by Argo CD, so the reaper commits `tier: none` to git and Argo CD
+  prunes the inference layer — see [Guardrails](#guardrails).
+- **Teardown cascades.** Every Application carries Argo CD's resources
+  finalizer, so deleting the root app removes the NodePools (Karpenter
+  terminates the nodes) and the Services (EKS deletes the NLBs) before
+  Terraform removes the cluster.
+- **Argo CD doesn't fight the autoscaler.** The model Deployment sets no
+  `replicas` and its Application ignores `/spec/replicas`; KEDA's HPA owns it.
+- **Synchronous feedback kept.** CI's verify job waits for Argo CD to report
+  every app Synced + Healthy and smoke-tests the model, so a push still ends in
+  a green or red check.
 
 ---
 
@@ -174,6 +210,16 @@ curl -s http://$EP/v1/chat/completions -H 'Content-Type: application/json' -d '{
 
 Tool calling (`tool_choice: "auto"`) is enabled on the Kimi tier with vLLM's
 `hermes` parser — Open WebUI and most agent frameworks need it.
+
+**Argo CD UI** — sync state and health of every resource:
+
+```bash
+make argocd-ui        # prints the admin password, serves http://localhost:8090
+make apps             # same, in the terminal
+```
+
+**On the free kind stack** the router is at `http://localhost:18080` and Open
+WebUI at `http://localhost:18081`.
 
 **Logs:**
 
@@ -208,7 +254,7 @@ on spot, but this account's 8-vCPU spot quota cannot hold a 48-vCPU node.
 |----------|------|
 | 2-hour Kimi session | ~$17.50 |
 | Cluster idling, no GPU | ~$6.20/day |
-| `make nuke` | ~$0 (S3 state only) |
+| `make destroy` | ~$0 (S3 state only) |
 
 **Where money leaks, and what this repo does about it:**
 
@@ -216,7 +262,7 @@ on spot, but this account's 8-vCPU spot quota cannot hold a 48-vCPU node.
 |------|-----------|------|
 | NAT Gateway (3 AZ) | $0.135/hr + $0.045/GB | **none** — public subnets + IGW; a 145 GB model download costs $0 in transfer |
 | Forgotten GPU node | $200/day (Kimi) | nightly reaper + budget alert |
-| EKS control plane left up | $73/month | `make nuke` |
+| EKS control plane left up | $73/month | `make destroy` (CI) |
 
 `make cost` shows actual spend attributed by the `Project` tag. Older model/shape
 analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
@@ -225,22 +271,26 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
 
 ## Guardrails
 
-- **Nightly reaper** (`.github/workflows/reaper.yml`) — destroys the inference
-  layer at 03:00 UTC every night via its own OIDC role, whatever `deploy/tier`
-  says. It fails loudly if any GPU instance survives. Bring the model back with
-  any push to `deploy/` or `make deploy`. Run it manually with "also destroy
-  cluster" for a full teardown.
+- **Nightly reaper** (`.github/workflows/reaper.yml`) — at 03:00 UTC it commits
+  `tier: none` to `deploy/config.yaml`, asks Argo CD to refresh, and waits for
+  the NodePools and Karpenter instances to disappear. If Argo CD hasn't pruned
+  them within 15 minutes it deletes the NodePools and terminates the instances
+  itself, and it fails loudly if any GPU instance survives. Bring the model back
+  with `make tier TIER=<tier>`.
 - **Karpenter consolidation** — a GPU node is terminated about a minute after
   its last model pod leaves.
 - **NodePool vCPU limits** match the quota, so an over-ask shows up as a
   Pending pod rather than a stream of EC2 errors.
-- **Destroy on demand** (`.github/workflows/destroy.yml`) — manual workflow
-  that tears down the inference layer, waits for NLBs and GPU nodes to go,
-  destroys the cluster, sweeps orphaned Karpenter instances and fails if
-  anything billable remains. Leaves only the S3 state bucket and OIDC roles.
-  Set `deploy/tier` to `none` first, or the next infra push rebuilds it.
+- **Destroy on demand** (`.github/workflows/destroy.yml`, `make destroy`) —
+  deletes the root Argo CD app (cascading to NodePools and NLBs), waits for the
+  NLBs and GPU nodes to go, destroys the cluster, sweeps leaked network
+  interfaces and orphaned instances, and fails if anything billable remains.
+  Leaves only the S3 state bucket and OIDC roles. Run `make cluster-off` first
+  so the next push can't rebuild it.
+- **`cluster: false` gate** — CI never creates the cluster unless git says so.
 - **AWS Budget + email** — set the `BUDGET_ALERT_EMAIL` secret to enable.
-- **IP allowlist** on both public endpoints (`ALLOWED_CIDRS`).
+- **IP allowlist** on both public endpoints (`ALLOWED_CIDRS`); the chart refuses
+  to render internet-facing Services on EKS if the list is empty.
 - **Tagging** — every resource carries `Project=llm-d-eks-lab`.
 
 ---
@@ -281,8 +331,9 @@ number decides which models you can run:
 | **KEDA** | Watches a metric and asks for more pods when it rises | Decides **how many** pods |
 | **Karpenter** | Sees pods with nowhere to run, buys matching machines, returns them when empty | Makes idle GPU cost zero |
 | **Open WebUI** | A chat interface | So you don't have to curl |
-| **Terraform** | Describes all of the above as files | Reproducible infrastructure |
-| **GitHub Actions + OIDC** | Runs Terraform on push, authenticating to AWS without stored keys | The only way anything is deployed |
+| **Terraform** | Describes the AWS infrastructure as files | Reproducible infrastructure |
+| **Argo CD** | Watches this git repo and makes the cluster match it, continuously | Deploys and self-heals everything on the cluster |
+| **GitHub Actions + OIDC** | Runs Terraform on push, authenticating to AWS without stored keys | The only way infrastructure changes |
 
 Three of these sound alike but aren't:
 
@@ -293,15 +344,16 @@ Three of these sound alike but aren't:
 ### What happens on a deploy
 
 ```
- git push (deploy/tier = kimi)
+ git push (deploy/config.yaml: tier: kimi)
      │
-     ├─ CI assumes an AWS role via OIDC, runs terraform for the inference layer
-     ├─ Kubernetes gets "1 copy of vLLM needing 2 GPUs" → no node fits → Pending
+     ├─ Argo CD sees the commit; the root app now renders the Kimi apps
+     ├─ it syncs the router, the NodePool and "1 copy of vLLM needing 2 GPUs"
+     ├─ no node fits → the pod is Pending
      ├─ Karpenter sees it, launches a g7e.12xlarge              (~2 min)
      ├─ vLLM pulls its image, downloads 145 GB of weights        (~6 min)
      ├─ loads them across both GPUs, captures CUDA graphs        (~4 min)
      ├─ vLLM reports healthy → the router adds it to the pool
-     └─ CI smoke-tests a completion and prints the URLs
+     └─ CI sees every Argo CD app Healthy, smoke-tests a completion, prints the URLs
 ```
 
 On the spot tiers (`small`, `gpu`), `make load` then shows the autoscaling:
@@ -378,8 +430,12 @@ signal is really measuring.
   handles.
 - **No NAT Gateway.** Nodes sit in public subnets behind security groups;
   model downloads go straight out the IGW.
-- **NVIDIA device plugin** is installed by Terraform: the EKS AL2023 NVIDIA AMI
-  ships the driver but not the plugin.
+- **NVIDIA device plugin** is an Argo CD app on the GPU tiers: the EKS AL2023
+  NVIDIA AMI ships the driver but not the plugin.
+- **App of apps.** Terraform creates one Argo CD Application, `root`, pointing
+  at `gitops/root`. It reads `tier` from `deploy/config.yaml` and renders one
+  child Application per component; `tier: none` renders none, so Argo CD prunes
+  them all.
 - **Access.** Cluster admins are explicit EKS access entries — the human admin,
   the CI deploy role and the reaper role — rather than "whoever ran Terraform."
 
@@ -397,8 +453,11 @@ signal is really measuring.
 | kube-prometheus-stack | 92.16.0 |
 | NVIDIA device plugin | 0.20.1 |
 | Open WebUI chart | 18.3.0 |
+| Argo CD chart | 10.18.0 (Argo CD v3.6.1) |
 
-The `validate` workflow checks that pinned charts and CRD URLs still resolve.
+The `validate` workflow checks that pinned charts and CRD URLs still resolve,
+and renders every GitOps chart for every tier and environment through strict
+schema validation (Kubernetes + Karpenter/KEDA/Argo CD CRDs).
 
 ---
 
@@ -447,8 +506,11 @@ in that directory. After that, `make bootstrap` works directly.
 `ALLOWED_CIDRS` is a secret rather than a variable so your IP is masked in
 Actions logs, which are public on a public repo.
 
-**4. Deploy.** Set `deploy/tier` and push, or run `make deploy TIER=sim`. The
-first run creates the cluster (~16 min), then the tier.
+**4. Deploy.** `make cluster-on` (CI builds EKS and Argo CD, ~20 min), then
+`make tier TIER=sim` to prove the path for pennies, then the tier you want.
+If you fork the repo, set `gitops_repo_url` in `terraform/10-cluster/variables.tf`
+and `repoURL` in `gitops/root/values.yaml` to your fork — Argo CD must read the
+repo without credentials, so it has to be public.
 
 **5. Protect `main`.** The deploy role has AdministratorAccess and trusts only
 workflows running on `main`, so whoever can push to `main` controls the AWS
@@ -459,47 +521,47 @@ account. Block force-pushes and require reviews from anyone but you.
 ## Layout
 
 ```
-deploy/tier             which tier should be running — the deploy switch
+deploy/config.yaml        the switch: cluster true|false, tier none|sim|small|gpu|kimi
 terraform/
-  00-bootstrap/         S3 state bucket, GitHub OIDC deploy + reaper roles   (local, once)
-  10-cluster/           VPC (no NAT), EKS, Karpenter, KEDA, Prometheus,     (CI, ~16 min)
-                        CRDs, access entries, budget
-  20-inference/         NodePool, NVIDIA plugin, llm-d router, vLLM,        (CI, minutes)
-                        KEDA ScaledObject, Open WebUI
-    tiers/*.tfvars      sim | small | gpu | kimi — the only difference between tiers
-manifests/router/       llm-d router values (shared by every tier)
-manifests/sim/, local/  the free kind tier
-loadgen/                k6 ramp script for `make load`
-.github/workflows/      deploy · destroy · reaper · validate
-docs/COSTS.md           shape/price analysis
+  00-bootstrap/           S3 state bucket, GitHub OIDC deploy + reaper roles    (local, once)
+  10-cluster/             VPC (no NAT), EKS, Karpenter, KEDA, Prometheus,      (CI)
+                          Argo CD, root Application, HF token Secret, budget
+gitops/                   everything Argo CD reconciles
+  root/                   app of apps: one Application per component
+  apps/model-server/      EC2NodeClass, NodePool, model Deployment, ScaledObject, Services
+  tiers/*.yaml            sim | small | gpu | kimi — the only difference between tiers
+  values/                 values for the upstream charts (llm-d router, Open WebUI, NVIDIA)
+  bootstrap/              Argo CD install values (shared by Terraform and kind)
+local/                    free kind proof: `make argocd-local`
+scripts/                  render-check (CI), wait-for-apps (CI + local), prices
+loadgen/                  k6 ramp script for `make load`
+.github/workflows/        deploy · destroy · reaper · validate
+docs/COSTS.md             shape/price analysis
 ```
-
-The 10/20 split exists because you iterate on the inference layer constantly
-and on the cluster rarely; a vLLM flag change should not risk a 16-minute
-cluster rebuild.
 
 ---
 
 ## Commands
 
 ```
-make deploy TIER=...  run the deploy workflow in CI and follow it
-make destroy          run the destroy workflow in CI: everything billable, to ~$0
-make kubeconfig       point kubectl at the cluster (context: llm-d-eks-lab)
-make watch            live view of ScaledObject, HPA, pods and nodes
-make load             fire k6 at the endpoint and watch replicas scale
+make cluster-on / cluster-off   allow / forbid CI to create the EKS cluster (commit + push)
+make tier TIER=...              set the tier Argo CD runs (commit + push)
+make follow                     follow the latest deploy run
+make deploy                     re-run the deploy workflow (reconcile + verify)
+make destroy                    destroy workflow: everything billable, to ~$0
 
-make sim-local        free local tier on kind (sim-local-down to remove)
+make kubeconfig                 kubectl access (context: llm-d-eks-lab)
+make argocd-ui                  Argo CD UI on http://localhost:8090
+make apps                       Argo CD application status
+make watch                      live view of ScaledObject, HPA, pods and nodes
+make load                       fire k6 at the endpoint and watch replicas scale
 
-make down             emergency: destroy the inference layer locally
-make nuke             emergency: destroy everything except state, then verify
+make argocd-local               the whole GitOps stack on kind, $0 (argocd-local-down to remove)
+make render                     render + schema-validate every chart/tier, no cluster
 
-make quota            GPU quota and what it buys
-make cost             actual spend by Project tag (Cost Explorer)
-make prices           current spot prices for the shapes used here
-make whats-running    anything billing, including a NAT gateway check
-make validate         terraform validate on every layer
-make bootstrap        apply 00-bootstrap (the one local apply)
+make quota | cost | prices | whats-running
+make validate                   terraform validate + render
+make bootstrap                  apply 00-bootstrap (the one local apply)
 ```
 
 ---
@@ -536,11 +598,13 @@ Things the first real deploy surfaced that `terraform validate` could not:
 - **llm-d's real wins need scale.** Prefix-cache routing and prefill/decode
   disaggregation pay off across many GPUs. On one or two replicas you are
   exercising the control plane, not demonstrating a speedup.
+- **Argo CD's UI is not exposed.** Reach it with `make argocd-ui`
+  (port-forward); there is no ingress or SSO.
 - **The Kimi tier cannot autoscale.** Quota fits exactly one 48-vCPU node; use
   `small` or `gpu` to watch 1→2 scaling.
 - **Endpoints have no auth.** The model API and Open WebUI are protected only
   by the IP allowlist. Widen `ALLOWED_CIDRS` and you should turn
-  `WEBUI_AUTH` back on in `terraform/20-inference/webui.tf`.
+  `WEBUI_AUTH` back on in `gitops/values/open-webui.yaml`.
 - **Public subnets.** Nodes have public IPs (that is the no-NAT trade-off);
   security groups are the boundary. Fine for a disposable lab, not a pattern
   for production.

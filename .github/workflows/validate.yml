@@ -53,29 +53,43 @@ jobs:
           done
           exit $fail
 
-  manifests:
+  gitops:
+    # Renders every Argo CD chart for every tier in both environments (EKS and
+    # kind), checks the guardrails refuse bad input, and validates the output
+    # against Kubernetes + Karpenter/KEDA/Argo CD schemas. No cluster needed.
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: YAML parses (after template substitution)
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+
+      - name: helm lint
+        run: |
+          helm lint gitops/root -f deploy/config.yaml
+          helm lint gitops/apps/model-server -f gitops/tiers/sim.yaml --set karpenter.enabled=false --set environment=kind
+
+      - name: Render + schema-validate every tier
+        run: ./scripts/render-check.sh
+
+      - name: Plain YAML parses
         run: |
           python3 - <<'PY'
           import glob, sys, yaml
-          subs = {
-            "${RELEASE}": "llm-d", "${NS}": "llm-d",
-            "${MODEL}": "Qwen/Qwen3.5-4B",
-            "${SIM_IMAGE}": "ghcr.io/llm-d/llm-d-inference-sim:v1.0.0",
-            "${inference_pool}": "llm-d",
-          }
+          files = sorted(glob.glob("local/*.yaml") + glob.glob("gitops/values/*.yaml")
+                         + glob.glob("gitops/tiers/*.yaml")) + ["deploy/config.yaml", "gitops/bootstrap/argocd-values.yaml"]
           bad = 0
-          for f in sorted(glob.glob("manifests/**/*.yaml*", recursive=True) + glob.glob("local/*.yaml")):
-              raw = open(f).read()
-              for k, v in subs.items():
-                  raw = raw.replace(k, v)
+          for f in files:
               try:
-                  list(yaml.safe_load_all(raw))
+                  list(yaml.safe_load_all(open(f)))
                   print(f"  OK   {f}")
               except Exception as e:
                   print(f"  FAIL {f}: {e}")
@@ -172,11 +186,23 @@ jobs:
           KEDA=$(grep -A3 'variable "keda_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           PROM=$(grep -A3 'variable "prometheus_chart_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           KARP=$(grep -A3 'variable "karpenter_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          ROUTER=$(grep -A3 'variable "router_chart_version"' terraform/20-inference/variables.tf | grep default | grep -oE 'v[0-9.]+')
+          ARGOCD=$(grep -A3 'variable "argocd_chart_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          # Charts Argo CD deploys are pinned in the root app's values.
+          ROUTER=$(awk '/^  router:/{print $2}' gitops/root/values.yaml)
+          WEBUI=$(awk '/^  openWebui:/{print $2}' gitops/root/values.yaml)
+          NVDP=$(awk '/^  nvidiaDevicePlugin:/{print $2}' gitops/root/values.yaml)
+
+          helm repo add argo https://argoproj.github.io/argo-helm >/dev/null
+          helm repo add open-webui https://helm.openwebui.com/ >/dev/null
+          helm repo add nvdp https://nvidia.github.io/k8s-device-plugin >/dev/null
+          helm repo update >/dev/null
 
           check_chart kedacore/keda "$KEDA"
           check_chart prometheus-community/kube-prometheus-stack "$PROM"
           check_ecr_public karpenter/karpenter "$KARP"
+          check_chart argo/argo-cd "$ARGOCD"
           check_chart oci://ghcr.io/llm-d/charts/llm-d-router-standalone "$ROUTER"
+          check_chart open-webui/open-webui "$WEBUI"
+          check_chart nvdp/nvidia-device-plugin "$NVDP"
 
           exit $fail

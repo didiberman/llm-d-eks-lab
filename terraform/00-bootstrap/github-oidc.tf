@@ -81,7 +81,9 @@ resource "aws_iam_role" "github_reaper" {
   tags = var.tags
 }
 
-# Permissions needed to run `terraform destroy` on 20-inference:
+# Permissions for the nightly reaper. Since the move to Argo CD it no longer
+# runs Terraform — it sets tier: none in git and verifies the GPUs are gone —
+# but the S3 access is kept for break-glass state inspection:
 #   - read/write the remote state in S3
 #   - describe the cluster and mint a token to reach its API
 #   - delete the NLB that the LoadBalancer Service created
@@ -148,7 +150,7 @@ resource "aws_iam_role_policy" "github_reaper" {
 
 # ---------------------------------------------------------------------------
 # Deploy role — what the deploy workflow assumes to apply 10-cluster and
-# 20-inference. Every deploy goes through CI; nothing is applied from a laptop
+# verify Argo CD. Every deploy goes through CI; nothing is applied from a laptop
 # except this bootstrap layer, which has to exist before CI can authenticate.
 #
 # Trust is narrower than the reaper's: only workflows running on main may

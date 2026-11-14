@@ -5,7 +5,7 @@
 # provisions nodes, so it cannot be the thing waiting for a node.
 #
 # No EBS CSI driver on purpose — model weights land on the Karpenter-managed
-# node root volume (sized in the 20-inference EC2NodeClass), so there is no
+# node root volume (sized per tier in the EC2NodeClass), so there is no
 # PersistentVolume in the picture and no reason to carry the addon.
 
 module "eks" {
@@ -66,9 +66,10 @@ module "eks" {
   #   cluster_creator — the human admin. Keyed to match the module's own
   #                     creator entry so a cluster first built locally adopts
   #                     it in place instead of replacing it.
-  #   deploy          — the GitHub Actions deploy role (applies 20-inference
-  #                     and the Helm releases here).
-  #   reaper          — the nightly reaper, which destroys 20-inference.
+  #   deploy          — the GitHub Actions deploy role (applies this layer
+  #                     and verifies Argo CD syncs).
+  #   reaper          — the nightly reaper, which waits for Argo CD to prune
+  #                     the inference layer and terminates stragglers.
   access_entries = { for k, v in {
     cluster_creator = var.admin_principal_arn
     deploy          = var.deploy_role_arn
