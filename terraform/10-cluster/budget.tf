@@ -1,6 +1,5 @@
-# Backstop only. The nightly reaper in .github/workflows is the real protection
-# against a forgotten GPU — a budget alert tells you after the money is spent,
-# whereas the reaper prevents the spend.
+# Backstop only. A budget alert tells you after the money is spent; setting
+# `tier: none` (or running the destroy workflow) is what stops the spend.
 #
 # Scoped to the Project tag so it tracks this lab rather than the whole account.
 

@@ -68,12 +68,9 @@ module "eks" {
   #                     it in place instead of replacing it.
   #   deploy          — the GitHub Actions deploy role (applies this layer
   #                     and verifies Argo CD syncs).
-  #   reaper          — the nightly reaper, which waits for Argo CD to prune
-  #                     the inference layer and terminates stragglers.
   access_entries = { for k, v in {
     cluster_creator = var.admin_principal_arn
     deploy          = var.deploy_role_arn
-    reaper          = var.reaper_role_arn
     } : k => {
     principal_arn = v
 

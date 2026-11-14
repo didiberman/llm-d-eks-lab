@@ -68,7 +68,7 @@ variable "api_allowed_cidrs" {
 }
 
 variable "budget_limit_usd" {
-  description = "Monthly budget in USD that triggers the SNS email alert. The nightly reaper is the real protection; this is the backstop."
+  description = "Monthly budget in USD that triggers the SNS email alert. It reports spend after the fact; `tier: none` and the destroy workflow are what stop it."
   type        = number
   default     = 50
 
@@ -138,12 +138,6 @@ variable "karpenter_version" {
   default     = "1.15.1"
 
   nullable = false
-}
-
-variable "reaper_role_arn" {
-  description = "IAM role ARN from the 00-bootstrap github_reaper_role_arn output. Granted cluster-admin via an EKS access entry so the nightly reaper can actually delete workloads. Null to skip."
-  type        = string
-  default     = null
 }
 
 variable "admin_principal_arn" {

@@ -4,8 +4,8 @@
 # chat goes through the EPP exactly like API traffic does.
 #
 # Deliberately light: no Ollama, Pipelines, Redis or Tika; no persistence (the
-# cluster has no EBS CSI driver, and the reaper wipes the inference layer
-# nightly anyway). Auth is off because the public Service only admits
+# cluster has no EBS CSI driver, and `tier: none` wipes the inference layer
+# anyway). Auth is off because the public Service only admits
 # allowedCidrs — the same boundary as the model API, which has no auth either.
 # Widen allowedCidrs and you must set WEBUI_AUTH back to True.
 ollama:

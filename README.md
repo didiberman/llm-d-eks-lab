@@ -7,8 +7,9 @@ the infrastructure; **Argo CD** runs everything on the cluster from git. A
 `git push` is the only deploy button.
 
 It is not "production grade." It is a practice environment where a real 72B
-model costs about **$8.70/hour** while you use it and **nothing** once it is
-reaped, with guardrails so a forgotten GPU cannot bill you for a week.
+model costs about **$8.70/hour** while you use it and **nothing** once you
+switch it off — one line in git takes the GPUs away, one workflow takes
+everything else.
 
 ```
  git push ─┬─▶ GitHub Actions (OIDC) ─▶ Terraform ─▶ VPC, EKS, IAM, Karpenter,
@@ -66,6 +67,10 @@ make kubeconfig            # kubectl access; `make argocd-ui` for the Argo CD UI
 make tier TIER=none        # GPUs gone, cluster stays (~$0.26/hr)
 make cluster-off && make destroy   # everything billable gone (~$0)
 ```
+
+> **Nothing switches it off for you.** A tier keeps its GPU node(s) running
+> until you set `tier: none` or run `make destroy` — Kimi left on is ~$200/day.
+> See [Guardrails](#guardrails).
 
 **Try it for free first.** `make argocd-local` builds the same stack on a local
 kind cluster — the same Argo CD install and root app, syncing this repo from
@@ -139,7 +144,7 @@ push to main
   can start the $0.26/hr base cost by mistake.
 - **Drift is impossible to keep.** Argo CD self-heals: a `kubectl edit` on the
   cluster is reverted to what git says.
-- **One at a time.** Deploy, reaper and destroy share a concurrency group.
+- **One at a time.** Deploy and destroy share a concurrency group.
 - **Credentials.** GitHub Actions assumes IAM roles via OIDC (no stored AWS
   keys). Argo CD pulls the public repo and needs no credentials at all.
 
@@ -170,9 +175,9 @@ How the hard parts were solved:
   Argo CD can use them: the HuggingFace token as a Kubernetes Secret, and the
   IP allowlist plus the Karpenter node IAM role as `valuesObject` on the root
   Application it creates. The repo is public; none of these are in it.
-- **The reaper no longer fights the reconciler.** Deleting resources would just
-  be undone by Argo CD, so the reaper commits `tier: none` to git and Argo CD
-  prunes the inference layer — see [Guardrails](#guardrails).
+- **Switching off goes through git too.** Deleting resources by hand would
+  just be undone by Argo CD, so `tier: none` is committed and Argo CD prunes
+  the inference layer; deleting the NodePool makes Karpenter return the nodes.
 - **Teardown cascades.** Every Application carries Argo CD's resources
   finalizer, so deleting the root app removes the NodePools (Karpenter
   terminates the nodes) and the Services (EKS deletes the NLBs) before
@@ -195,7 +200,7 @@ kubectl -n llm-d get svc open-webui-public
 ```
 
 No login: it is reachable only from the IPs in `ALLOWED_CIDRS`. Chats are not
-persisted (no volume), so a pod restart or the nightly reaper wipes them.
+persisted (no volume), so a pod restart or `tier: none` wipes them.
 
 **OpenAI-compatible API** — the router's public endpoint, same IP allowlist:
 
@@ -261,7 +266,7 @@ on spot, but this account's 8-vCPU spot quota cannot hold a 48-vCPU node.
 | Leak | Naive cost | Here |
 |------|-----------|------|
 | NAT Gateway (3 AZ) | $0.135/hr + $0.045/GB | **none** — public subnets + IGW; a 145 GB model download costs $0 in transfer |
-| Forgotten GPU node | $200/day (Kimi) | nightly reaper + budget alert |
+| Forgotten GPU node | $200/day (Kimi) | `make tier TIER=none` + budget alert — nothing turns it off automatically |
 | EKS control plane left up | $73/month | `make destroy` (CI) |
 
 `make cost` shows actual spend attributed by the `Project` tag. Older model/shape
@@ -271,12 +276,14 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
 
 ## Guardrails
 
-- **Nightly reaper** (`.github/workflows/reaper.yml`) — at 03:00 UTC it commits
-  `tier: none` to `deploy/config.yaml`, asks Argo CD to refresh, and waits for
-  the NodePools and Karpenter instances to disappear. If Argo CD hasn't pruned
-  them within 15 minutes it deletes the NodePools and terminates the instances
-  itself, and it fails loudly if any GPU instance survives. Bring the model back
-  with `make tier TIER=<tier>`.
+> [!WARNING]
+> There is **no scheduled shutdown**. Every tier keeps at least one model
+> replica (`minReplicas: 1`), so its GPU node runs until you turn it off. End
+> every session with `make tier TIER=none` (or `make destroy`).
+
+- **`tier: none`** (`make tier TIER=none`) — Argo CD prunes the inference
+  layer; deleting the NodePool makes Karpenter terminate its nodes. The
+  cluster stays (~$0.26/hr). CI's verify job fails if any NodePool remains.
 - **Karpenter consolidation** — a GPU node is terminated about a minute after
   its last model pod leaves.
 - **NodePool vCPU limits** match the quota, so an over-ask shows up as a
@@ -285,10 +292,12 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
   deletes the root Argo CD app (cascading to NodePools and NLBs), waits for the
   NLBs and GPU nodes to go, destroys the cluster, sweeps leaked network
   interfaces and orphaned instances, and fails if anything billable remains.
-  Leaves only the S3 state bucket and OIDC roles. Run `make cluster-off` first
+  Leaves only the S3 state bucket and the OIDC deploy role. Run `make cluster-off` first
   so the next push can't rebuild it.
 - **`cluster: false` gate** — CI never creates the cluster unless git says so.
-- **AWS Budget + email** — set the `BUDGET_ALERT_EMAIL` secret to enable.
+- **AWS Budget + email** — set the `BUDGET_ALERT_EMAIL` secret to enable. It
+  tells you after the money is spent; it does not stop anything.
+- **`make whats-running`** — lists anything billable still up in the region.
 - **IP allowlist** on both public endpoints (`ALLOWED_CIDRS`); the chart refuses
   to render internet-facing Services on EKS if the list is empty.
 - **Tagging** — every resource carries `Project=llm-d-eks-lab`.
@@ -436,8 +445,8 @@ signal is really measuring.
   at `gitops/root`. It reads `tier` from `deploy/config.yaml` and renders one
   child Application per component; `tier: none` renders none, so Argo CD prunes
   them all.
-- **Access.** Cluster admins are explicit EKS access entries — the human admin,
-  the CI deploy role and the reaper role — rather than "whoever ran Terraform."
+- **Access.** Cluster admins are explicit EKS access entries — the human admin
+  and the CI deploy role — rather than "whoever ran Terraform."
 
 ### Pinned versions
 
@@ -495,12 +504,10 @@ in that directory. After that, `make bootstrap` works directly.
 | Kind | Name | Value |
 |------|------|-------|
 | secret | `AWS_DEPLOY_ROLE_ARN` | `github_deploy_role_arn` |
-| secret | `AWS_REAPER_ROLE_ARN` | `github_reaper_role_arn` |
 | secret | `ALLOWED_CIDRS` | e.g. `["203.0.113.7/32"]` — who may reach the endpoints |
 | secret | `HF_TOKEN` | optional; faster HuggingFace downloads |
 | secret | `BUDGET_ALERT_EMAIL` | optional; enables the budget alert |
 | variable | `STATE_BUCKET` | `state_bucket` |
-| variable | `REAPER_ROLE_ARN` | `github_reaper_role_arn` |
 | variable | `ADMIN_PRINCIPAL_ARN` | your IAM user/role ARN, for `kubectl` |
 
 `ALLOWED_CIDRS` is a secret rather than a variable so your IP is masked in
@@ -523,7 +530,7 @@ account. Block force-pushes and require reviews from anyone but you.
 ```
 deploy/config.yaml        the switch: cluster true|false, tier none|sim|small|gpu|kimi
 terraform/
-  00-bootstrap/           S3 state bucket, GitHub OIDC deploy + reaper roles    (local, once)
+  00-bootstrap/           S3 state bucket, GitHub OIDC deploy role             (local, once)
   10-cluster/             VPC (no NAT), EKS, Karpenter, KEDA, Prometheus,      (CI)
                           Argo CD, root Application, HF token Secret, budget
 gitops/                   everything Argo CD reconciles
@@ -535,7 +542,7 @@ gitops/                   everything Argo CD reconciles
 local/                    free kind proof: `make argocd-local`
 scripts/                  render-check (CI), wait-for-apps (CI + local), prices
 loadgen/                  k6 ramp script for `make load`
-.github/workflows/        deploy · destroy · reaper · validate
+.github/workflows/        deploy · destroy · validate
 docs/COSTS.md             shape/price analysis
 ```
 
@@ -581,7 +588,7 @@ Things the first real deploy surfaced that `terraform validate` could not:
   aside; with nothing else installed the Service never gets an address.
 - **GitHub immutable OIDC subjects** (`repo:owner@id/repo@id:…`) break trust
   policies written for `repo:owner/repo:…` — every assume fails with "Not
-  authorized." The nightly reaper failed silently for two weeks because of it.
+  authorized." A scheduled workflow failed silently for two weeks because of it.
 - **The EKS AL2023 NVIDIA AMI has no device plugin.** Without it, GPU nodes
   never advertise `nvidia.com/gpu`.
 - **Default gp3 writes at 125 MB/s** — about 20 minutes just to write 145 GB.
@@ -609,7 +616,7 @@ Things the first real deploy surfaced that `terraform validate` could not:
   security groups are the boundary. Fine for a disposable lab, not a pattern
   for production.
 - **Ephemeral by design.** No persistent volumes: Open WebUI chats and
-  downloaded weights vanish with their pods, and the reaper runs nightly.
+  downloaded weights vanish with their pods.
 
 ## License
 

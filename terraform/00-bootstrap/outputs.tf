@@ -24,11 +24,6 @@ output "backend_config" {
   EOT
 }
 
-output "github_reaper_role_arn" {
-  description = "ARN to put in the AWS_REAPER_ROLE_ARN GitHub secret. Null unless github_repo is set."
-  value       = try(aws_iam_role.github_reaper[0].arn, null)
-}
-
 output "github_deploy_role_arn" {
   description = "ARN to put in the AWS_DEPLOY_ROLE_ARN GitHub secret. Null unless github_repo is set."
   value       = try(aws_iam_role.github_deploy[0].arn, null)

@@ -164,7 +164,7 @@ whats-running: ## Anything in this account currently costing money for this proj
 ##@ Bootstrap & break-glass
 
 .PHONY: bootstrap
-bootstrap: ## Apply 00-bootstrap: state bucket + CI roles (the one layer applied locally)
+bootstrap: ## Apply 00-bootstrap: state bucket + CI deploy role (the one layer applied locally)
 	@acct=$$(aws sts get-caller-identity --query Account --output text); \
 	cd $(BOOTSTRAP) && $(TF) init -input=false \
 	  -backend-config="bucket=$(PROJECT)-tfstate-$$acct" -backend-config="region=$(REGION)" && \

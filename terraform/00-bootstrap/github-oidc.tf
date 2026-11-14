@@ -1,8 +1,8 @@
-# GitHub Actions OIDC role for the nightly reaper.
+# GitHub Actions OIDC: the provider and the deploy role CI assumes.
 #
-# Lives in 00-bootstrap, not 10-cluster, because the reaper's whole job is to
-# destroy 10/20 — it cannot depend on the thing it deletes. This layer is also
-# the only one `make nuke` leaves standing.
+# Lives in 00-bootstrap, not 10-cluster, because CI needs the role before it
+# can build anything, and the destroy workflow uses it to tear 10-cluster down.
+# This layer is the only one `make destroy` leaves standing.
 #
 # Set github_repo to enable. Left null by default so a fresh clone does not
 # create IAM principals nobody asked for.
@@ -33,128 +33,19 @@ locals {
   )
 }
 
-data "aws_iam_policy_document" "github_assume" {
-  count = var.github_repo == null ? 0 : 1
-
-  statement {
-    effect  = "Allow"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-
-    principals {
-      type        = "Federated"
-      identifiers = [local.oidc_arn]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-
-    # Scoped to this repository only. Without this condition ANY GitHub repo
-    # in the world could assume the role.
-    #
-    # Repos with immutable OIDC subjects enabled send
-    # `repo:<owner>@<owner-id>/<name>@<repo-id>:...` instead of
-    # `repo:<owner>/<name>:...`; the plain form then never matches and every
-    # assume fails with "Not authorized". Check which one a repo sends with:
-    #   gh api repos/<owner>/<name>/actions/oidc/customization/sub
-    #
-    # Pinned to main: the reaper runs on schedule and workflow_dispatch, both
-    # of which execute on the default branch. A wildcard would let a workflow
-    # on any branch assume the role — unacceptable once the repo is public.
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = ["${coalesce(var.github_oidc_sub_prefix, "repo:${var.github_repo}")}:ref:refs/heads/main"]
-    }
-  }
-}
-
-resource "aws_iam_role" "github_reaper" {
-  count = var.github_repo == null ? 0 : 1
-
-  name               = "${var.project}-github-reaper"
-  description        = "Assumed by GitHub Actions to destroy the inference layer nightly"
-  assume_role_policy = data.aws_iam_policy_document.github_assume[0].json
-
-  tags = var.tags
-}
-
-# Permissions for the nightly reaper. Since the move to Argo CD it no longer
-# runs Terraform — it sets tier: none in git and verifies the GPUs are gone —
-# but the S3 access is kept for break-glass state inspection:
-#   - read/write the remote state in S3
-#   - describe the cluster and mint a token to reach its API
-#   - delete the NLB that the LoadBalancer Service created
-#   - terminate the instances Karpenter launched, in case Karpenter itself is
-#     already gone when the reaper runs
-data "aws_iam_policy_document" "github_reaper" {
-  count = var.github_repo == null ? 0 : 1
-
-  statement {
-    sid    = "RemoteState"
-    effect = "Allow"
-
-    actions = [
-      "s3:ListBucket",
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-    ]
-
-    resources = [
-      aws_s3_bucket.this.arn,
-      "${aws_s3_bucket.this.arn}/*",
-    ]
-  }
-
-  statement {
-    sid    = "ClusterAccess"
-    effect = "Allow"
-
-    actions = [
-      "eks:DescribeCluster",
-      "eks:ListClusters",
-    ]
-
-    resources = ["*"]
-  }
-
-  statement {
-    sid    = "TeardownCompute"
-    effect = "Allow"
-
-    actions = [
-      "ec2:DescribeInstances",
-      "ec2:DescribeInstanceTypes",
-      "ec2:DescribeSubnets",
-      "ec2:DescribeSecurityGroups",
-      "ec2:TerminateInstances",
-      "elasticloadbalancing:Describe*",
-      "elasticloadbalancing:DeleteLoadBalancer",
-      "elasticloadbalancing:DeleteTargetGroup",
-    ]
-
-    resources = ["*"]
-  }
-}
-
-resource "aws_iam_role_policy" "github_reaper" {
-  count = var.github_repo == null ? 0 : 1
-
-  name   = "reaper"
-  role   = aws_iam_role.github_reaper[0].id
-  policy = data.aws_iam_policy_document.github_reaper[0].json
-}
-
 # ---------------------------------------------------------------------------
 # Deploy role — what the deploy workflow assumes to apply 10-cluster and
 # verify Argo CD. Every deploy goes through CI; nothing is applied from a laptop
 # except this bootstrap layer, which has to exist before CI can authenticate.
 #
-# Trust is narrower than the reaper's: only workflows running on main may
-# assume it, so a pull request from a branch cannot deploy or read state.
+# Trust is pinned to main: only workflows running on main may assume it, so a
+# pull request from a branch cannot deploy or read state.
+#
+# Repos with immutable OIDC subjects enabled send
+# `repo:<owner>@<owner-id>/<name>@<repo-id>:...` instead of
+# `repo:<owner>/<name>:...`; the plain form then never matches and every
+# assume fails with "Not authorized". Check which one a repo sends with:
+#   gh api repos/<owner>/<name>/actions/oidc/customization/sub
 #
 # AdministratorAccess because 10-cluster creates a VPC, an EKS cluster, IAM
 # roles, KMS keys, SQS queues and EventBridge rules — enumerating that surface

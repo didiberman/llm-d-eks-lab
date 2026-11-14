@@ -22,7 +22,6 @@
 #   secret   HF_TOKEN             = optional, HuggingFace token
 #   secret   BUDGET_ALERT_EMAIL   = optional, enables the AWS Budget alert
 #   variable STATE_BUCKET         = 00-bootstrap output state_bucket
-#   variable REAPER_ROLE_ARN      = 00-bootstrap output github_reaper_role_arn
 #   variable ADMIN_PRINCIPAL_ARN  = IAM user/role that gets kubectl access
 name: deploy
 
@@ -41,7 +40,7 @@ permissions:
   id-token: write # OIDC
   contents: read
 
-# Shared with reaper and destroy: never race an apply or a teardown.
+# Shared with destroy: never race an apply against a teardown.
 concurrency:
   group: aws-llm-d-eks-lab
   cancel-in-progress: false
@@ -136,7 +135,6 @@ jobs:
       - name: Terraform inputs
         env:
           DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          REAPER_ROLE_ARN: ${{ vars.REAPER_ROLE_ARN }}
           ADMIN_PRINCIPAL_ARN: ${{ vars.ADMIN_PRINCIPAL_ARN }}
           BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
           ALLOWED_CIDRS: ${{ secrets.ALLOWED_CIDRS }}
@@ -150,7 +148,6 @@ jobs:
             echo "TF_VAR_project=$CLUSTER"
             echo "TF_VAR_deploy_role_arn=$DEPLOY_ROLE_ARN"
             echo "TF_VAR_allowed_cidrs=$ALLOWED_CIDRS"
-            [ -n "$REAPER_ROLE_ARN" ] && echo "TF_VAR_reaper_role_arn=$REAPER_ROLE_ARN"
             [ -n "$ADMIN_PRINCIPAL_ARN" ] && echo "TF_VAR_admin_principal_arn=$ADMIN_PRINCIPAL_ARN"
             [ -n "$BUDGET_ALERT_EMAIL" ] && echo "TF_VAR_budget_alert_email=$BUDGET_ALERT_EMAIL"
             [ -n "$HF_TOKEN" ] && echo "TF_VAR_hf_token=$HF_TOKEN"

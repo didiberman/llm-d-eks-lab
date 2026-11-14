@@ -38,7 +38,7 @@ variable "tags" {
 }
 
 variable "github_repo" {
-  description = "GitHub repo in owner/name form, enabling the OIDC role the nightly reaper assumes. Leave null to skip creating any IAM principal."
+  description = "GitHub repo in owner/name form, enabling the OIDC deploy role GitHub Actions assumes. Leave null to skip creating any IAM principal."
   type        = string
   default     = null
 }

@@ -247,9 +247,9 @@ Ranked by what they'd cost over a month if left alone:
 
 | Leak | Idle cost | Mitigation |
 |------|-----------|------------|
-| Forgotten `g6e.24xlarge` spot | **~$2,950/mo** | nightly reaper + budget alarm |
-| Forgotten `g6e.xlarge` spot | ~$930/mo | nightly reaper + budget alarm |
-| EKS control plane | $73/mo | `make nuke`; reaper |
+| Forgotten `g6e.24xlarge` spot | **~$2,950/mo** | `tier: none` + budget alarm |
+| Forgotten `g6e.xlarge` spot | ~$930/mo | `tier: none` + budget alarm |
+| EKS control plane | $73/mo | `make destroy` |
 | **NAT Gateway** × 3 AZ | **$98/mo** | **none created** — public subnets + IGW |
 | NLB | $16/mo | destroyed with layer 20 |
 | NAT data processing | $0.045/GB | n/a — no NAT |

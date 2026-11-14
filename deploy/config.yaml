@@ -12,6 +12,6 @@
 #            gpu    Qwen3.6-27B-FP8 on g6e.xlarge (L40S), spot   ~$1.80/hr/replica
 #            kimi   Kimi-Dev-72B on g7e.12xlarge (2x 96 GB)      ~$8.42/hr
 #
-# The nightly reaper sets tier back to none at 03:00 UTC.
+# Nothing resets tier automatically: set it back to none when you are done.
 cluster: false
 tier: none
