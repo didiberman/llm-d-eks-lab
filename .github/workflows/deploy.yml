@@ -1,0 +1,332 @@
+# Deploy — the only way 10-cluster and 20-inference get applied.
+#
+# Push to main, and whatever changed is planned and applied:
+#
+#   terraform/10-cluster/**                    -> cluster layer (then inference)
+#   terraform/20-inference/**, manifests/router/**, deploy/**
+#                                              -> inference layer
+#
+# Docs, README and anything else never trigger a deploy. Each layer is planned
+# with -detailed-exitcode and applied only when the plan has changes, so a push
+# that alters nothing in AWS costs a plan, not an apply.
+#
+# The tier to run lives in deploy/tier. workflow_dispatch can override it for
+# a single run without a commit.
+#
+# 00-bootstrap is NOT applied here: it creates the role this workflow assumes.
+#
+# SETUP (one time):
+#   secret   AWS_DEPLOY_ROLE_ARN  = 00-bootstrap output github_deploy_role_arn
+#   variable STATE_BUCKET         = 00-bootstrap output state_bucket
+#   variable REAPER_ROLE_ARN      = 00-bootstrap output github_reaper_role_arn
+#   variable ADMIN_PRINCIPAL_ARN  = IAM user/role that gets kubectl access
+#   secret   ALLOWED_CIDRS        = JSON list for the public endpoints, e.g. ["1.2.3.4/32"]
+#                                   (a secret, not a variable, so the IP is masked
+#                                   in Actions logs, which are public on a public repo)
+#   secret   HF_TOKEN             = optional, HuggingFace token
+#   secret   BUDGET_ALERT_EMAIL   = optional, enables the AWS Budget + SNS alert
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/10-cluster/**"
+      - "terraform/20-inference/**"
+      - "manifests/router/**"
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Tier for this run (from-file reads deploy/tier)"
+        type: choice
+        options: [from-file, none, sim, small, gpu, kimi]
+        default: from-file
+
+permissions:
+  id-token: write # OIDC
+  contents: read
+
+# Shared with the reaper: two workflows must never hold the same state lock or
+# race a deploy against a teardown.
+concurrency:
+  group: aws-llm-d-eks-lab
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  CLUSTER: llm-d-eks-lab
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  TF_VERSION: "1.13.4"
+
+jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      cluster: ${{ steps.scope.outputs.cluster }}
+      inference: ${{ steps.scope.outputs.inference }}
+      tier: ${{ steps.scope.outputs.tier }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Work out what changed and which tier to run
+        id: scope
+        env:
+          BEFORE: ${{ github.event.before }}
+          INPUT_TIER: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+
+          tier="${INPUT_TIER:-from-file}"
+          if [ "$tier" = "from-file" ]; then
+            tier=$(grep -vE '^[[:space:]]*(#|$)' deploy/tier | head -n1 | tr -d '[:space:]')
+          fi
+          case "$tier" in
+            none|sim|small|gpu|kimi) ;;
+            *) echo "::error::deploy/tier must be one of none|sim|small|gpu|kimi, got '$tier'"; exit 1 ;;
+          esac
+
+          if [ "${{ github.event_name }}" != "push" ] || [ -z "$BEFORE" ] \
+             || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            # Manual run, brand-new branch, or a force-push whose previous
+            # head no longer exists: plan both layers. Unchanged layers
+            # produce an empty plan and are not applied.
+            cluster=true; inference=true
+          else
+            changed=$(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+            echo "Changed files:"; echo "$changed" | sed 's/^/  /'
+            cluster=false; inference=false
+            if echo "$changed" | grep -qE '^(terraform/10-cluster/|\.github/workflows/deploy\.yml$)'; then cluster=true; fi
+            if echo "$changed" | grep -qE '^(terraform/20-inference/|manifests/router/|deploy/)'; then inference=true; fi
+            # Inference reads cluster outputs, so a cluster change re-plans it.
+            if [ "$cluster" = true ]; then inference=true; fi
+          fi
+
+          echo "cluster=$cluster inference=$inference tier=$tier"
+          {
+            echo "cluster=$cluster"
+            echo "inference=$inference"
+            echo "tier=$tier"
+          } >> "$GITHUB_OUTPUT"
+
+  cluster:
+    needs: scope
+    if: needs.scope.outputs.cluster == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: terraform/10-cluster
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      # Actions logs are public on a public repo. The account ID is not a
+      # credential, but there is no reason to publish it in every plan.
+      - name: Mask account ID
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Only export inputs that are actually set: an empty TF_VAR_ is the
+      # empty string, not null, and an access entry for "" fails.
+      - name: Terraform inputs
+        env:
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          REAPER_ROLE_ARN: ${{ vars.REAPER_ROLE_ARN }}
+          ADMIN_PRINCIPAL_ARN: ${{ vars.ADMIN_PRINCIPAL_ARN }}
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
+        run: |
+          set -euo pipefail
+          [ -n "${{ vars.STATE_BUCKET }}" ] || { echo "::error::Repo variable STATE_BUCKET is not set"; exit 1; }
+          {
+            echo "TF_VAR_region=$AWS_REGION"
+            echo "TF_VAR_project=$CLUSTER"
+            echo "TF_VAR_deploy_role_arn=$DEPLOY_ROLE_ARN"
+            [ -n "$REAPER_ROLE_ARN" ] && echo "TF_VAR_reaper_role_arn=$REAPER_ROLE_ARN"
+            [ -n "$ADMIN_PRINCIPAL_ARN" ] && echo "TF_VAR_admin_principal_arn=$ADMIN_PRINCIPAL_ARN"
+            [ -n "$BUDGET_ALERT_EMAIL" ] && echo "TF_VAR_budget_alert_email=$BUDGET_ALERT_EMAIL"
+            true
+          } >> "$GITHUB_ENV"
+
+      - name: terraform init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}"
+
+      # A cluster built before this role existed has no access entry for it,
+      # and the Helm/Kubernetes providers cannot even refresh without one.
+      # Create it out of band, then adopt it into state so Terraform owns it.
+      # A no-op on every run after the first.
+      - name: Ensure this role can reach an existing cluster
+        env:
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          admin_policy="arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          if ! aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+            echo "No cluster yet — Terraform will create it with this role's access entry."
+            exit 0
+          fi
+          if ! aws eks describe-access-entry --cluster-name "$CLUSTER" --principal-arn "$DEPLOY_ROLE_ARN" >/dev/null 2>&1; then
+            echo "Creating access entry for the deploy role"
+            aws eks create-access-entry --cluster-name "$CLUSTER" --principal-arn "$DEPLOY_ROLE_ARN" --type STANDARD >/dev/null
+            aws eks associate-access-policy --cluster-name "$CLUSTER" --principal-arn "$DEPLOY_ROLE_ARN" \
+              --policy-arn "$admin_policy" --access-scope type=cluster >/dev/null
+            sleep 20 # access entries take a few seconds to reach the API server
+          fi
+          if ! terraform state show 'module.eks.aws_eks_access_entry.this["deploy"]' >/dev/null 2>&1; then
+            terraform import 'module.eks.aws_eks_access_entry.this["deploy"]' "${CLUSTER}:${DEPLOY_ROLE_ARN}"
+          fi
+          if ! terraform state show 'module.eks.aws_eks_access_policy_association.this["deploy_admin"]' >/dev/null 2>&1; then
+            terraform import 'module.eks.aws_eks_access_policy_association.this["deploy_admin"]' "${CLUSTER}#${DEPLOY_ROLE_ARN}#${admin_policy}"
+          fi
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          case $code in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT"; echo "### 10-cluster: no changes" >> "$GITHUB_STEP_SUMMARY" ;;
+            2) echo "changes=true" >> "$GITHUB_OUTPUT"
+               { echo "### 10-cluster plan"; echo '```'; terraform show -no-color tfplan | grep -E '^\s*# |^Plan:' ; echo '```'; } >> "$GITHUB_STEP_SUMMARY" ;;
+            *) exit $code ;;
+          esac
+
+      - name: terraform apply
+        if: steps.plan.outputs.changes == 'true'
+        run: terraform apply -no-color tfplan
+
+  inference:
+    needs: [scope, cluster]
+    # Runs when the cluster job succeeded or was skipped (nothing to do there).
+    if: >-
+      always() &&
+      needs.scope.outputs.inference == 'true' &&
+      (needs.cluster.result == 'success' || needs.cluster.result == 'skipped')
+    runs-on: ubuntu-latest
+    # Kimi pulls 145GB of weights; the Deployment wait alone can run 40 minutes.
+    timeout-minutes: 120
+    env:
+      TIER: ${{ needs.scope.outputs.tier }}
+    defaults:
+      run:
+        working-directory: terraform/20-inference
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      # Actions logs are public on a public repo. The account ID is not a
+      # credential, but there is no reason to publish it in every plan.
+      - name: Mask account ID
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform inputs
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ALLOWED_CIDRS: ${{ secrets.ALLOWED_CIDRS }}
+        run: |
+          set -euo pipefail
+          [ -n "${{ vars.STATE_BUCKET }}" ] || { echo "::error::Repo variable STATE_BUCKET is not set"; exit 1; }
+          {
+            echo "TF_VAR_region=$AWS_REGION"
+            echo "TF_VAR_project=$CLUSTER"
+            echo "TF_VAR_state_bucket=${{ vars.STATE_BUCKET }}"
+            [ -n "$HF_TOKEN" ] && echo "TF_VAR_hf_token=$HF_TOKEN"
+            [ -n "$ALLOWED_CIDRS" ] && echo "TF_VAR_allowed_cidrs=$ALLOWED_CIDRS"
+            true
+          } >> "$GITHUB_ENV"
+
+      - name: Cluster present?
+        id: cluster
+        run: |
+          if aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No EKS cluster — nothing to deploy the inference layer onto."
+          fi
+
+      - name: terraform init
+        if: steps.cluster.outputs.exists == 'true'
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Destroy inference layer (tier = none)
+        if: steps.cluster.outputs.exists == 'true' && env.TIER == 'none'
+        run: terraform destroy -no-color -auto-approve
+
+      - name: terraform plan
+        id: plan
+        if: steps.cluster.outputs.exists == 'true' && env.TIER != 'none'
+        run: |
+          set +e
+          terraform plan -no-color -out=tfplan -detailed-exitcode -var-file="tiers/${TIER}.tfvars"
+          code=$?
+          set -e
+          case $code in
+            0) echo "changes=false" >> "$GITHUB_OUTPUT"; echo "### 20-inference ($TIER): no changes" >> "$GITHUB_STEP_SUMMARY" ;;
+            2) echo "changes=true" >> "$GITHUB_OUTPUT"
+               { echo "### 20-inference ($TIER) plan"; echo '```'; terraform show -no-color tfplan | grep -E '^\s*# |^Plan:' ; echo '```'; } >> "$GITHUB_STEP_SUMMARY" ;;
+            *) exit $code ;;
+          esac
+
+      - name: terraform apply
+        if: steps.plan.outputs.changes == 'true'
+        run: terraform apply -no-color tfplan
+
+      # Through a port-forward rather than the public NLB: ALLOWED_CIDRS
+      # normally excludes GitHub's runners, and this checks the router and
+      # model server, which is what a deploy changes.
+      - name: Smoke test
+        if: steps.cluster.outputs.exists == 'true' && env.TIER != 'none'
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER" >/dev/null
+          model=$(terraform output -raw model)
+          kubectl -n llm-d rollout status deploy/llm-d-vllm-decode --timeout=45m
+          kubectl -n llm-d port-forward svc/llm-d-epp 8080:80 >/tmp/pf.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf -o /dev/null http://localhost:8080/v1/models && break; sleep 2; done
+          resp=$(curl -sS --max-time 300 http://localhost:8080/v1/completions \
+            -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$model\",\"prompt\":\"def fibonacci(n):\",\"max_tokens\":48}")
+          echo "$resp" | jq . || echo "$resp"
+          text=$(echo "$resp" | jq -r '.choices[0].text // empty')
+          [ -n "$text" ] || { echo "::error::No completion returned by $model"; exit 1; }
+          endpoint=$(terraform output -raw endpoint || true)
+          webui=$(terraform output -raw webui_url || true)
+          {
+            echo "### Serving \`$model\` (tier: $TIER)"
+            echo "Public endpoint: \`http://${endpoint:-<none>}\`"
+            echo "Open WebUI: ${webui:-<disabled>}"
+            echo '```'; echo "$text"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

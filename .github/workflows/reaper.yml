@@ -1,0 +1,142 @@
+# Nightly reaper — the highest-value cost guardrail in this repo.
+#
+# Destroys the inference layer every night regardless of state, so a forgotten
+# GPU node cannot bill for a week. A g6e.xlarge left running is ~$44/day; a
+# g6e.24xlarge is ~$97/day.
+#
+# Only touches 20-inference. The cluster itself ($0.185/hr) is left alone so a
+# session interrupted at midnight can resume in four minutes rather than
+# sixteen. Set reap_cluster to also take out 10-cluster.
+#
+# SETUP (the workflow no-ops safely until these exist):
+#   1. terraform/00-bootstrap with github_repo = "didiberman/llm-d-eks-lab"
+#   2. Repo secret AWS_REAPER_ROLE_ARN = the github_reaper_role_arn output
+#   3. Repo variable STATE_BUCKET      = the state_bucket output
+name: reaper
+
+on:
+  schedule:
+    # 03:00 UTC daily. Cron in GitHub Actions is best-effort and can be delayed
+    # by up to ~an hour under load, which is fine for a backstop.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      reap_cluster:
+        description: "Also destroy 10-cluster (full teardown to $0.00/hr)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write # required for OIDC
+  contents: read
+
+# Shared with the deploy workflow so a teardown never races an apply for the
+# same state lock.
+concurrency:
+  group: aws-llm-d-eks-lab
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  TF_IN_AUTOMATION: "1"
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check the reaper is configured
+        id: guard
+        run: |
+          if [ -z "${{ secrets.AWS_REAPER_ROLE_ARN }}" ] || [ -z "${{ vars.STATE_BUCKET }}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Reaper not configured::Set the AWS_REAPER_ROLE_ARN secret and STATE_BUCKET variable. Skipping — GPUs are NOT being reaped."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.guard.outputs.configured == 'true'
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: steps.guard.outputs.configured == 'true'
+        with:
+          role-to-assume: ${{ secrets.AWS_REAPER_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Mask account ID
+        if: steps.guard.outputs.configured == 'true'
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.guard.outputs.configured == 'true'
+        with:
+          terraform_version: "1.13.4"
+          terraform_wrapper: false
+
+      # If there is no cluster there is nothing to pay for, and `terraform
+      # destroy` against a missing cluster fails on provider setup rather than
+      # succeeding trivially.
+      - name: Is anything actually running?
+        if: steps.guard.outputs.configured == 'true'
+        id: running
+        run: |
+          clusters=$(aws eks list-clusters --region "$AWS_REGION" --query 'length(clusters)' --output text)
+          echo "clusters=$clusters" >> "$GITHUB_OUTPUT"
+          echo "Found $clusters EKS cluster(s)."
+
+      - name: Destroy the inference layer
+        if: steps.guard.outputs.configured == 'true' && steps.running.outputs.clusters != '0'
+        working-directory: terraform/20-inference
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}"
+          # -refresh=false would be faster but we specifically want to notice
+          # resources that drifted, since those are the ones still billing.
+          terraform destroy -input=false -auto-approve \
+            -var "region=${AWS_REGION}" \
+            -var "state_bucket=${{ vars.STATE_BUCKET }}"
+
+      - name: Destroy the cluster too
+        if: >-
+          steps.guard.outputs.configured == 'true' &&
+          steps.running.outputs.clusters != '0' &&
+          inputs.reap_cluster
+        working-directory: terraform/10-cluster
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}"
+          terraform destroy -input=false -auto-approve -var "region=${AWS_REGION}"
+
+      # Runs even if destroy failed — a failed teardown is exactly when you
+      # most need to know what is still costing money.
+      - name: Report what is still billing
+        if: always() && steps.guard.outputs.configured == 'true'
+        run: |
+          echo "### Reaper report" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "EKS clusters:" >> "$GITHUB_STEP_SUMMARY"
+          aws eks list-clusters --region "$AWS_REGION" --query clusters --output text >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo "Running instances:" >> "$GITHUB_STEP_SUMMARY"
+          aws ec2 describe-instances --region "$AWS_REGION" \
+            --filters Name=instance-state-name,Values=running,pending \
+            --query 'Reservations[].Instances[].[InstanceType,InstanceId]' --output text >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo "Load balancers:" >> "$GITHUB_STEP_SUMMARY"
+          aws elbv2 describe-load-balancers --region "$AWS_REGION" \
+            --query 'LoadBalancers[].LoadBalancerName' --output text >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail loudly if GPU instances survived
+        if: always() && steps.guard.outputs.configured == 'true'
+        run: |
+          gpus=$(aws ec2 describe-instances --region "$AWS_REGION" \
+            --filters Name=instance-state-name,Values=running,pending \
+            --query "Reservations[].Instances[?starts_with(InstanceType,'g') || starts_with(InstanceType,'p')].InstanceId" \
+            --output text)
+          if [ -n "$gpus" ]; then
+            echo "::error title=GPU instances still running::$gpus — the reaper did not clean these up."
+            exit 1
+          fi
+          echo "No GPU instances running."

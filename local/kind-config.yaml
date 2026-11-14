@@ -1,0 +1,45 @@
+# kind cluster for T0 — the $0 tier.
+#
+# Runs the entire llm-d control plane (router, EPP, KEDA, Prometheus) against
+# llm-d-inference-sim, which speaks the vLLM OpenAI API and emits genuine vLLM
+# Prometheus metrics. Everything about the autoscaling path behaves as it would
+# on real GPUs; only the tokens are fake.
+#
+# Karpenter is deliberately absent — it provisions EC2 instances and has no
+# meaning here. Node autoscaling is the one part of the stack T0 cannot
+# exercise; that is what T1 on EKS is for.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: llm-d-eks-lab
+
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "llm-d-eks-lab/role=system"
+    extraPortMappings:
+      # Router's Envoy listener, so the endpoint is reachable on localhost:8080
+      # without a port-forward.
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+
+  # Two workers labelled as model-server capacity so the same nodeSelector used
+  # on EKS works unchanged, and so a 1->2 scale-out has somewhere to land.
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "llm-d-eks-lab/role=model-server,llm-d-eks-lab/tier=sim"
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "llm-d-eks-lab/role=model-server,llm-d-eks-lab/tier=sim"

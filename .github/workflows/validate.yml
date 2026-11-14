@@ -1,0 +1,182 @@
+# Static checks only — no AWS credentials, no cost, runs on every push and PR.
+#
+# Deliberately does NOT run `terraform plan`: that needs real credentials and a
+# real state bucket, and this repo is a public lab. The checks here are the ones
+# that catch the mistakes that actually happen: drifted formatting, renamed
+# module variables, invalid YAML, and chart or CRD versions that have been
+# yanked upstream.
+name: validate
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.13.4"
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff terraform/
+
+      - name: terraform validate (all layers)
+        run: |
+          fail=0
+          for d in terraform/*/; do
+            [ -f "$d/versions.tf" ] || continue
+            echo "::group::$d"
+            # -backend=false so no credentials or state bucket are needed.
+            if ! (cd "$d" && terraform init -backend=false -input=false >/dev/null && terraform validate); then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  manifests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: YAML parses (after template substitution)
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          subs = {
+            "${RELEASE}": "llm-d", "${NS}": "llm-d",
+            "${MODEL}": "Qwen/Qwen3.5-4B",
+            "${SIM_IMAGE}": "ghcr.io/llm-d/llm-d-inference-sim:v1.0.0",
+            "${inference_pool}": "llm-d",
+          }
+          bad = 0
+          for f in sorted(glob.glob("manifests/**/*.yaml*", recursive=True) + glob.glob("local/*.yaml")):
+              raw = open(f).read()
+              for k, v in subs.items():
+                  raw = raw.replace(k, v)
+              try:
+                  list(yaml.safe_load_all(raw))
+                  print(f"  OK   {f}")
+              except Exception as e:
+                  print(f"  FAIL {f}: {e}")
+                  bad = 1
+          sys.exit(bad)
+          PY
+
+      - name: Shell scripts parse
+        run: |
+          for f in scripts/*.sh local/*.sh; do
+            [ -e "$f" ] || continue
+            bash -n "$f" && echo "  OK   $f"
+          done
+
+  upstream-pins:
+    # The versions this project pins live in other people's release pages.
+    # Charts get yanked and CRD assets get renamed; this catches it on a
+    # schedule instead of ten minutes into an apply.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Pinned charts and CRDs still resolve
+        run: |
+          set -u
+          fail=0
+          # Same principle as check_ecr_public: only a definitive 404/410 means
+          # the asset was removed. Network trouble or throttling warns.
+          check_url() {
+            local code
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 30 --retry 2 "$1" || echo "000")
+            case "$code" in
+              200) echo "  OK   $1" ;;
+              404|410) echo "  FAIL ($code) $1 — asset removed upstream"; fail=1 ;;
+              *) echo "::warning title=Could not verify asset::$1 returned $code"
+                 echo "  SKIP ($code) $1" ;;
+            esac
+          }
+
+          GW=$(grep -A3 'variable "gateway_api_version"' terraform/10-cluster/variables.tf | grep default | grep -oE 'v[0-9.]+')
+          GAIE=$(grep -A3 'variable "gaie_version"' terraform/10-cluster/variables.tf | grep default | grep -oE 'v[0-9.]+')
+          check_url "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GW}/standard-install.yaml"
+          check_url "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/${GAIE}/v1-manifests.yaml"
+
+          helm repo add kedacore https://kedacore.github.io/charts >/dev/null
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
+          helm repo update >/dev/null
+
+          check_chart() {
+            if helm show chart "$1" --version "$2" >/dev/null 2>&1; then echo "  OK   $1 $2"; else echo "  FAIL $1 $2"; fail=1; fi
+          }
+
+          # public.ecr.aws issues a bearer token even for public repositories,
+          # and `helm show chart` does not fetch one — it works on a laptop
+          # only because ambient AWS/docker credentials are already present,
+          # and fails on a clean runner. So query the OCI manifest directly
+          # with an anonymous token.
+          #
+          # Two traps found the hard way:
+          #   - /tags/list pages at 1000 entries and silently omits newer tags,
+          #     so 1.15.1 reads as absent while its manifest returns 200.
+          #   - public.ecr.aws rate-limits anonymous requests from shared
+          #     GitHub Actions IP ranges, so 429s are routine.
+          #
+          # A 429 is not evidence the chart is gone; failing the build on one
+          # is a false negative. Only a definitive 404/403 fails. Anything else
+          # retries, then warns.
+          check_ecr_public() {
+            local repo="$1" tag="$2" tok code attempt
+            for attempt in 1 2 3; do
+              tok=$(curl -sf --max-time 20 https://public.ecr.aws/token/ \
+                | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null || echo "")
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+                -H "Authorization: Bearer $tok" \
+                -H 'Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json' \
+                "https://public.ecr.aws/v2/${repo}/manifests/${tag}" || echo "000")
+              case "$code" in
+                200)
+                  echo "  OK   public.ecr.aws/${repo}:${tag}"
+                  return 0
+                  ;;
+                404|403)
+                  echo "  FAIL ($code) public.ecr.aws/${repo}:${tag} — tag is gone or private"
+                  fail=1
+                  return 0
+                  ;;
+              esac
+              sleep $((attempt * 5))
+            done
+            echo "::warning title=Could not verify Karpenter chart::public.ecr.aws returned $code after 3 attempts (rate limiting is common from CI). This is NOT evidence the chart is missing — verify locally with: helm show chart oci://public.ecr.aws/${repo} --version ${tag}"
+            echo "  SKIP ($code) public.ecr.aws/${repo}:${tag} — could not reach registry"
+          }
+          KEDA=$(grep -A3 'variable "keda_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          PROM=$(grep -A3 'variable "prometheus_chart_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          KARP=$(grep -A3 'variable "karpenter_version"' terraform/10-cluster/variables.tf | grep default | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          ROUTER=$(grep -A3 'variable "router_chart_version"' terraform/20-inference/variables.tf | grep default | grep -oE 'v[0-9.]+')
+
+          check_chart kedacore/keda "$KEDA"
+          check_chart prometheus-community/kube-prometheus-stack "$PROM"
+          check_ecr_public karpenter/karpenter "$KARP"
+          check_chart oci://ghcr.io/llm-d/charts/llm-d-router-standalone "$ROUTER"
+
+          exit $fail

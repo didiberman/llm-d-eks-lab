@@ -1,0 +1,64 @@
+# KEDA ScaledObject for the local/sim tiers — the same configuration
+# terraform/20-inference/autoscaling.tf applies on EKS, as plain YAML.
+#
+# Scales on EPP DEMAND signals, not utilisation. Two triggers raced by the
+# generated HPA (larger desired count wins):
+#
+#   llm_d_epp_flow_control_queue_size   unmet demand       target 1  per replica
+#   llm_d_epp_request_running           active concurrency target 16 per replica
+#
+# The queue metric exists only because the router runs with
+# `featureGates: [flowControl]` (see manifests/router/values.yaml.tftpl).
+# Without that gate this query returns empty and nothing scales — silently.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ${RELEASE}-keda-epp
+  namespace: ${NS}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${RELEASE}-vllm-decode
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  # On kind this is just node capacity; on EKS it is the GPU quota ceiling.
+  maxReplicaCount: 4
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: keda-hpa-${RELEASE}
+      behavior:
+        # A replica still loading weights serves nothing, so demand stays
+        # elevated (scale-up overshoot) then collapses once Ready (scale-down
+        # flap). Both windows damp that. Shorter here than on EKS because the
+        # simulator starts in seconds, not minutes.
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+  triggers:
+    - type: prometheus
+      name: epp-queue-size
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090
+        query: >-
+          sum(llm_d_epp_flow_control_queue_size{namespace="${NS}",service="${RELEASE}-epp",model_name="${MODEL}"})
+        threshold: "1"
+    - type: prometheus
+      name: epp-running-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://llmd-kube-prometheus-stack-prometheus.llm-d-monitoring.svc.cluster.local:9090
+        query: >-
+          sum(llm_d_epp_request_running{namespace="${NS}",service="${RELEASE}-epp",model_name="${MODEL}"})
+        threshold: "16"
