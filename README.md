@@ -324,11 +324,11 @@ Everything below is a consequence of those three.
 
 ### Who decides what
 
-Think of a busy restaurant. Customers queue at the door. A **maitre d'** decides which table each one gets. A **manager** decides how many waiters are on shift. A **staffing agency** decides how many kitchens to rent.
+Think of a busy restaurant. Customers queue at the door. A **host** decides which table each one gets. A **manager** decides how many waiters are on shift. A **staffing agency** decides how many kitchens to rent.
 
 | Piece | In the restaurant | What it decides |
 |---|---|---|
-| **llm-d router** (EPP) | maitre d' | which pod gets this request |
+| **llm-d router** (EPP) | host | which pod gets this request |
 | **KEDA** | manager | how many pods |
 | **Karpenter** | staffing agency | how many GPU nodes |
 | **vLLM** | the kitchen | actually runs the model |
