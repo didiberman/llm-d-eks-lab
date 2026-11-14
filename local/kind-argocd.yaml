@@ -13,10 +13,10 @@ nodes:
     extraPortMappings:
       # NodePorts from the model-server chart's kind mode.
       - containerPort: 30080   # router (OpenAI API)
-        hostPort: 8080
+        hostPort: 18080
         protocol: TCP
       - containerPort: 30081   # Open WebUI
-        hostPort: 8081
+        hostPort: 18081
         protocol: TCP
   - role: worker
     labels:

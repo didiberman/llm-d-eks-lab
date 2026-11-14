@@ -125,10 +125,10 @@ step "Waiting for Argo CD to sync and every app to report Healthy"
 ./scripts/wait-for-apps.sh 900
 
 if [ "$TIER" != none ]; then
-  step "Smoke test through the router (localhost:8080)"
+  step "Smoke test through the router (localhost:18080)"
   model=$(awk '/^model:/{print $2}' "gitops/tiers/${TIER}.yaml")
-  for i in $(seq 1 30); do curl -sf -o /dev/null http://localhost:8080/v1/models && break; sleep 2; done
-  curl -s http://localhost:8080/v1/completions -H 'Content-Type: application/json' \
+  for i in $(seq 1 30); do curl -sf -o /dev/null http://localhost:18080/v1/models && break; sleep 2; done
+  curl -s http://localhost:18080/v1/completions -H 'Content-Type: application/json' \
     -d "{\"model\":\"${model}\",\"prompt\":\"Hello\",\"max_tokens\":12}" | jq -c '{model, text: .choices[0].text}'
 fi
 
@@ -136,8 +136,8 @@ cat <<EOF
 
 $(printf '\033[1;32mGitOps stack is up on kind — cost: $0.00\033[0m')
 
-  Model API:   http://localhost:8080/v1/models
-  Open WebUI:  http://localhost:8081
+  Model API:   http://localhost:18080/v1/models
+  Open WebUI:  http://localhost:18081
   Argo CD UI:  kubectl -n argocd port-forward svc/argocd-server 8090:80   -> http://localhost:8090
                user admin, password:
                kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d
