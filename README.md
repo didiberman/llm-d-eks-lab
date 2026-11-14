@@ -1,6 +1,6 @@
 # llm-d on EKS — autoscaled LLM inference you can afford to practice on
 
-[![llm-d: Serving LLMs on Kubernetes](docs/llm-d-cover.webp)](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes)
+[![llm-d: Serving LLMs on Kubernetes](docs/llm-d-architecture-cover.webp)](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes)
 
 **Read the article:** [llm-d in Plain English: Serving LLMs on Kubernetes](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes) - the plain-English story behind this repo.
 
