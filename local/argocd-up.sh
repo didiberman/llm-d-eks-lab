@@ -124,6 +124,9 @@ spec:
     automated:
       prune: true
       selfHeal: true
+      # Required for tier none: it renders no child apps, and Argo CD refuses to
+      # auto-sync a result that would prune every resource without this.
+      allowEmpty: true
 EOF
 
 step "Waiting for Argo CD to sync and every app to report Healthy"

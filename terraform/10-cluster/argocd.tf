@@ -96,6 +96,11 @@ resource "kubectl_manifest" "root_app" {
         automated = {
           prune    = true
           selfHeal = true
+          # REQUIRED for `tier: none`. That tier renders no child apps, and
+          # Argo CD refuses to auto-sync a result that would prune every
+          # resource ("auto-sync will wipe out all resources") unless this is
+          # set. Without it the GPUs would never be switched off.
+          allowEmpty = true
         }
       }
     }
