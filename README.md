@@ -1,5 +1,9 @@
 # llm-d on EKS — autoscaled LLM inference you can afford to practice on
 
+[![llm-d: Serving LLMs on Kubernetes](docs/llm-d-cover.webp)](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes)
+
+**Read the article:** [llm-d in Plain English: Serving LLMs on Kubernetes](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes) - the plain-English story behind this repo.
+
 A learning lab: [llm-d](https://llm-d.ai) **v1.0.0** serving open-weights models
 on EKS, autoscaled on **inference queue depth** (not CPU), with GPU nodes that
 appear when needed and disappear when idle. **Terraform + GitHub Actions** build
@@ -22,7 +26,7 @@ everything else.
 ```
 
 > **New to LLM serving or Kubernetes?** Start with
-> [How this works, from scratch](#how-this-works-from-scratch). Already know the
+> [Serving LLMs on Kubernetes, in plain English](#serving-llms-on-kubernetes-in-plain-english). Already know the
 > pieces? Jump to [Quick start](#quick-start).
 
 ---
@@ -36,7 +40,7 @@ everything else.
 - [Using the model](#using-the-model)
 - [Costs](#costs)
 - [Guardrails](#guardrails)
-- [How this works, from scratch](#how-this-works-from-scratch)
+- [Serving LLMs on Kubernetes, in plain English](#serving-llms-on-kubernetes-in-plain-english)
 - [Architecture](#architecture)
 - [Setting it up in your own account](#setting-it-up-in-your-own-account)
 - [Layout](#layout)
@@ -304,94 +308,87 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
 
 ---
 
-## How this works, from scratch
+## Serving LLMs on Kubernetes, in plain English
 
-*If you've never deployed an LLM or touched Kubernetes, start here.*
+*Also published as [an article](https://didibe.dev/blog/llm-d-serving-llms-on-kubernetes).*
 
-### What we're building
+### Why an LLM is not a web app
 
-A web service you send a question to and get an AI-generated answer from — the
-same shape as the OpenAI API, except it runs on hardware you rent by the hour
-and **switches itself off when nobody is using it.**
+Three things break the usual Kubernetes playbook:
 
-### Why a GPU at all?
+1. **The model has to fit in GPU memory.** Weights live in VRAM, not RAM. Rule of thumb: about 1 byte per parameter at FP8, 2 at BF16. A 72B model in BF16 is roughly 145 GB. No single GPU holds that, so it gets split across two.
+2. **GPU utilization lies.** A GPU doing inference reads about 100% busy whether it is keeping up or hopelessly behind. CPU-style autoscaling cannot tell the difference.
+3. **Requests have memory.** While generating, the model keeps notes on the conversation in VRAM. That is the **KV cache**. Send the next message to a different pod and the notes are gone - it has to re-read the whole conversation.
 
-A language model is a very large pile of numbers called *weights*. Producing one
-word means multiplying your input through all of them — tens of billions of
-multiplications per word for a large model. A CPU does a few dozen at once; a
-GPU does thousands. That is the whole reason GPUs are involved.
+Everything below is a consequence of those three.
 
-The catch: **the weights must fit in the GPU's own memory (VRAM).** That one
-number decides which models you can run:
+### Who decides what
 
-> **Rule of thumb: ~1 byte of VRAM per parameter for FP8, ~2 for BF16.**
-> A 27B FP8 model needs ~28 GB; Kimi-Dev-72B in BF16 needs ~135 GB — more than
-> any single GPU here, so it is split across two.
+Think of a busy restaurant. Customers queue at the door. A **maitre d'** decides which table each one gets. A **manager** decides how many waiters are on shift. A **staffing agency** decides how many kitchens to rent.
 
-### The pieces, in plain language
+| Piece | In the restaurant | What it decides |
+|---|---|---|
+| **llm-d router** (EPP) | maitre d' | which pod gets this request |
+| **KEDA** | manager | how many pods |
+| **Karpenter** | staffing agency | how many GPU nodes |
+| **vLLM** | the kitchen | actually runs the model |
 
-| Thing | What it actually is | Why it's here |
-|-------|---------------------|---------------|
-| **the model** | Tens to hundreds of GB of numbers from HuggingFace | Does the thinking |
-| **vLLM** | Loads the weights onto GPUs and answers HTTP requests | The inference engine |
-| **Kubernetes / EKS** | Runs programs across machines and restarts them when they die; EKS is Amazon's hosted version | Manages the copies of vLLM |
-| **pod** | One running copy of a program | One pod = one vLLM server |
-| **llm-d router + EPP** | A smart front door; the *endpoint picker* chooses which vLLM pod gets each request | Prefers the least busy pod, or one that already has your conversation cached |
-| **KEDA** | Watches a metric and asks for more pods when it rises | Decides **how many** pods |
-| **Karpenter** | Sees pods with nowhere to run, buys matching machines, returns them when empty | Makes idle GPU cost zero |
-| **Open WebUI** | A chat interface | So you don't have to curl |
-| **Terraform** | Describes the AWS infrastructure as files | Reproducible infrastructure |
-| **Argo CD** | Watches this git repo and makes the cluster match it, continuously | Deploys and self-heals everything on the cluster |
-| **GitHub Actions + OIDC** | Runs Terraform on push, authenticating to AWS without stored keys | The only way infrastructure changes |
+Three of those sound alike. They are not. Mixing them up is the most common confusion.
 
-Three of these sound alike but aren't:
+### What llm-d adds
 
-- **KEDA** decides *how many* pods should exist.
-- **EPP** decides *which* existing pod serves a request.
-- **Karpenter** decides *how many machines* are needed to hold the pods.
+A plain Kubernetes Service round-robins. For LLMs that wastes exactly what you paid for.
 
-### What happens on a deploy
+llm-d puts a router in front: Envoy plus an **endpoint picker (EPP)**. For every request it scores every pod:
 
-```
- git push (deploy/config.yaml: tier: kimi)
-     │
-     ├─ Argo CD sees the commit; the root app now renders the Kimi apps
-     ├─ it syncs the router, the NodePool and "1 copy of vLLM needing 2 GPUs"
-     ├─ no node fits → the pod is Pending
-     ├─ Karpenter sees it, launches a g7e.12xlarge              (~2 min)
-     ├─ vLLM pulls its image, downloads 145 GB of weights        (~6 min)
-     ├─ loads them across both GPUs, captures CUDA graphs        (~4 min)
-     ├─ vLLM reports healthy → the router adds it to the pool
-     └─ CI sees every Argo CD app Healthy, smoke-tests a completion, prints the URLs
+- **queue length** - how busy is it right now
+- **KV-cache use** - how full is its memory
+- **prefix-cache hit** - does it already hold this conversation's notes
+
+The same conversation lands on the pod that already has it. No re-reading. Faster first token, less wasted GPU.
+
+### Scale on queue depth, not GPU %
+
+The router sees every request, so it knows how many are waiting. That is the real demand signal. KEDA reads it from Prometheus:
+
+```yaml
+triggers:
+  - type: prometheus
+    metricType: AverageValue
+    metadata:
+      query: sum(llm_d_epp_flow_control_queue_size{model_name="..."})
+      threshold: "1"   # one waiting request per replica = add a pod
 ```
 
-On the spot tiers (`small`, `gpu`), `make load` then shows the autoscaling:
-requests queue → KEDA asks for a second pod → Karpenter buys a second GPU node →
-traffic stops → KEDA scales back → Karpenter returns the node.
+Nothing waiting: you are keeping up. Something waiting: add capacity. The whole loop:
 
-### The clever bit: scale on queue depth, not CPU
+1. Requests pile up. KEDA adds a pod.
+2. No free GPU, so the pod sits **Pending**.
+3. Karpenter sees it, reads what it asked for, and launches a matching GPU node.
+4. Traffic stops. Replicas drop. The node is empty.
+5. About a minute later, Karpenter gives it back.
 
-Normal autoscaling says "CPU at 80%, add servers." **That fails for LLMs:** a
-GPU doing inference reads ~100% busy whether it is keeping up or drowning. What
-distinguishes the two is **how many requests are waiting.** The EPP exposes that
-queue depth, and that is what KEDA scales on.
+Idle GPU cost is zero. That is the whole point.
 
-### The KV cache
-
-While generating, the model keeps notes on the conversation so far in VRAM — the
-**KV cache** — and every concurrent conversation needs its own:
+### The VRAM math
 
 ```
- ┌───────────────── 2 × 96 GB (Kimi tier) ─────────────────┐
- │  weights ~135 GiB (split across both)  │  KV ~34 GiB     │
- └────────────────────────────────────────┴─────────────────┘
-          fixed cost                         how many people
-                                             can be served at once
+ +------------------ 2 x 96 GB GPU -------------------+
+ |  weights ~135 GiB (split)      |  KV cache ~34 GiB  |
+ +--------------------------------+--------------------+
+        fixed cost                  how many people fit
 ```
 
-A model too big for its GPUs leaves a tiny KV cache, so only a couple of
-requests run at once and the rest queue. KV headroom is what the queue-depth
-signal is really measuring.
+Weights are a fixed cost. What is left over is KV cache, and KV cache is how many conversations fit at once. Squeeze it and requests queue - which is why queue depth is the right signal. For Kimi-Dev-72B on two 96 GB GPUs that is about 110,000 tokens of cache: roughly three full 32k conversations at the same time.
+
+### The whole thing in four lines
+
+- An LLM needs its weights in VRAM, a KV cache per conversation, and a GPU that reads 100% busy either way.
+- llm-d puts a router in front that picks the pod by queue, cache use and prefix hits.
+- KEDA scales pods on queue depth. Karpenter buys GPU nodes for pending pods and returns them when empty.
+- Keep it all in git and it costs about $8 an hour while you use it, nothing after.
+
+The mental model that stuck: **llm-d is a load balancer that knows what is in each GPU's memory.** The sharp edges I hit along the way are in [Lessons learned](#lessons-learned).
 
 ### Jargon decoder
 
@@ -595,6 +592,11 @@ Things the first real deploy surfaced that `terraform validate` could not:
   1000 MB/s costs ~$0.05/hr and brought the download to ~6 minutes.
 - **vLLM rejects `tool_choice: "auto"`** unless started with
   `--enable-auto-tool-choice` and a parser, and Open WebUI sends it.
+- **Argo CD refuses to prune everything.** With `tier: none` the root app renders
+  no children, and Argo CD will not auto-sync a result that deletes every resource
+  ("auto-sync will wipe out all resources") unless `allowEmpty: true` is set.
+  Without it the GPUs would never switch off. Found by running the teardown on
+  kind before trusting it.
 - **Spot isn't always cheaper.** `g6e.xlarge` spot ran within 3% of on-demand,
   with a spot placement score of 1/10 across the region.
 
