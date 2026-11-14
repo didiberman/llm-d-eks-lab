@@ -101,6 +101,14 @@ deploy: ## Run the deploy workflow in CI (TIER=none|sim|small|gpu|kimi, default 
 	@sleep 5
 	@gh run watch $$(gh run list --workflow deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId') --exit-status
 
+.PHONY: destroy
+destroy: ## Run the destroy workflow in CI: tear down ALL billable infra (asks you to confirm)
+	@read -p "Destroy the cluster and everything on it? Type 'destroy': " c; \
+	[ "$$c" = destroy ] || { echo "Aborted."; exit 1; }; \
+	gh workflow run destroy.yml -f confirm=destroy
+	@sleep 5
+	@gh run watch $$(gh run list --workflow destroy.yml --limit 1 --json databaseId --jq '.[0].databaseId') --exit-status
+
 .PHONY: kubeconfig
 kubeconfig: ## Point local kubectl at the cluster (context alias: llm-d-eks-lab)
 	@# --region is explicit: the CLI default region may differ from the

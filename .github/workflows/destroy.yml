@@ -1,0 +1,204 @@
+# Destroy — tear down ALL billable infrastructure, on demand.
+#
+# Actions → destroy → Run workflow, type "destroy" to confirm.
+#
+# Order matters:
+#   1. 20-inference  model server, router, Open WebUI, NodePools. Deleting the
+#                    NodePool makes Karpenter terminate the GPU nodes; deleting
+#                    the Services makes EKS delete their NLBs (asynchronously).
+#   2. wait          for those NLBs and Karpenter nodes to actually disappear.
+#                    A leftover NLB holds ENIs and a security group in the VPC
+#                    and makes step 3 fail with DependencyViolation.
+#   3. 10-cluster    EKS, Karpenter controller, KEDA, Prometheus, VPC.
+#   4. sweep         terminate any Karpenter instance that outlived its
+#                    controller, then fail loudly if anything still bills.
+#
+# Left in place on purpose (~$0): 00-bootstrap — the S3 state bucket
+# (prevent_destroy) and the GitHub OIDC roles this workflow itself uses.
+#
+# deploy/tier is NOT changed. The next push touching deploy/, terraform/ or
+# manifests/router/ recreates the cluster and that tier — set deploy/tier to
+# "none" first if you want it to stay down.
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to tear down the cluster and everything on it'
+        required: true
+        type: string
+
+permissions:
+  id-token: write # OIDC
+  contents: read
+
+# Same group as deploy and reaper: never race an apply for the state lock.
+concurrency:
+  group: aws-llm-d-eks-lab
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  CLUSTER: llm-d-eks-lab
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  TF_VERSION: "1.13.4"
+
+jobs:
+  destroy:
+    if: inputs.confirm == 'destroy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - name: Mask account ID
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Same inputs the deploy workflow passes, so the destroy plan evaluates
+      # the configuration exactly as it was applied.
+      - name: Terraform inputs
+        env:
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          REAPER_ROLE_ARN: ${{ vars.REAPER_ROLE_ARN }}
+          ADMIN_PRINCIPAL_ARN: ${{ vars.ADMIN_PRINCIPAL_ARN }}
+          BUDGET_ALERT_EMAIL: ${{ secrets.BUDGET_ALERT_EMAIL }}
+          ALLOWED_CIDRS: ${{ secrets.ALLOWED_CIDRS }}
+        run: |
+          set -euo pipefail
+          [ -n "${{ vars.STATE_BUCKET }}" ] || { echo "::error::Repo variable STATE_BUCKET is not set"; exit 1; }
+          {
+            echo "TF_VAR_region=$AWS_REGION"
+            echo "TF_VAR_project=$CLUSTER"
+            echo "TF_VAR_state_bucket=${{ vars.STATE_BUCKET }}"
+            echo "TF_VAR_deploy_role_arn=$DEPLOY_ROLE_ARN"
+            [ -n "$REAPER_ROLE_ARN" ] && echo "TF_VAR_reaper_role_arn=$REAPER_ROLE_ARN"
+            [ -n "$ADMIN_PRINCIPAL_ARN" ] && echo "TF_VAR_admin_principal_arn=$ADMIN_PRINCIPAL_ARN"
+            [ -n "$BUDGET_ALERT_EMAIL" ] && echo "TF_VAR_budget_alert_email=$BUDGET_ALERT_EMAIL"
+            [ -n "$ALLOWED_CIDRS" ] && echo "TF_VAR_allowed_cidrs=$ALLOWED_CIDRS"
+            true
+          } >> "$GITHUB_ENV"
+
+      - name: Cluster present?
+        id: cluster
+        run: |
+          if aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No EKS cluster found — skipping the Terraform destroys, sweeping only."
+          fi
+
+      - name: Destroy 20-inference
+        if: steps.cluster.outputs.exists == 'true'
+        working-directory: terraform/20-inference
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}"
+          terraform destroy -no-color -auto-approve
+
+      - name: Wait for Kubernetes-created load balancers and GPU nodes to go
+        if: steps.cluster.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            lbs=$(aws resourcegroupstaggingapi get-resources \
+              --resource-type-filters elasticloadbalancing:loadbalancer \
+              --tag-filters "Key=kubernetes.io/cluster/${CLUSTER}" \
+              --query 'length(ResourceTagMappingList)' --output text)
+            nodes=$(aws ec2 describe-instances \
+              --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
+                        "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
+                        "Name=instance-state-name,Values=pending,running,stopping,shutting-down" \
+              --query 'length(Reservations[].Instances[])' --output text)
+            echo "load balancers=$lbs karpenter nodes=$nodes"
+            [ "$lbs" = "0" ] && [ "$nodes" = "0" ] && exit 0
+            sleep 15
+          done
+          echo "::warning::Load balancers or Karpenter nodes still present after 10 minutes — continuing; the sweep step will report them."
+
+      - name: Destroy 10-cluster
+        if: steps.cluster.outputs.exists == 'true'
+        working-directory: terraform/10-cluster
+        run: |
+          terraform init -no-color \
+            -backend-config="bucket=${{ vars.STATE_BUCKET }}" \
+            -backend-config="region=${AWS_REGION}"
+          terraform destroy -no-color -auto-approve
+
+      # Karpenter terminates its nodes when a NodePool is deleted, but if the
+      # controller died first they are orphaned and Terraform never knew them.
+      - name: Sweep orphaned Karpenter instances
+        if: always()
+        run: |
+          ids=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
+                      "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -n "$ids" ]; then
+            echo "Terminating orphaned Karpenter instances: $ids"
+            aws ec2 terminate-instances --instance-ids $ids >/dev/null
+          else
+            echo "None."
+          fi
+
+      - name: Verify nothing is still billing
+        if: always()
+        run: |
+          set -u
+          if aws eks describe-cluster --name "$CLUSTER" >/dev/null 2>&1; then clusters=1; else clusters=0; fi
+          instances=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=${CLUSTER}" "Name=instance-state-name,Values=pending,running" \
+            --query 'length(Reservations[].Instances[])' --output text)
+          karp=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodepool" "Name=tag:eks:eks-cluster-name,Values=${CLUSTER}" \
+                      "Name=instance-state-name,Values=pending,running" \
+            --query 'length(Reservations[].Instances[])' --output text)
+          lbs=$(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:loadbalancer \
+            --tag-filters "Key=kubernetes.io/cluster/${CLUSTER}" --query 'length(ResourceTagMappingList)' --output text)
+          nats=$(aws ec2 describe-nat-gateways --filter Name=state,Values=available "Name=tag:Project,Values=${CLUSTER}" \
+            --query 'length(NatGateways)' --output text)
+          vpcs=$(aws ec2 describe-vpcs --filters "Name=tag:Project,Values=${CLUSTER}" --query 'length(Vpcs)' --output text)
+          {
+            echo "### Destroy report"
+            echo "| Resource | Remaining |"
+            echo "|---|---|"
+            echo "| EKS cluster | $clusters |"
+            echo "| Project-tagged instances | $instances |"
+            echo "| Karpenter instances | $karp |"
+            echo "| Cluster load balancers | $lbs |"
+            echo "| NAT gateways | $nats |"
+            echo "| Project VPCs | $vpcs |"
+            echo ""
+            echo "Left on purpose: S3 state bucket and GitHub OIDC roles (00-bootstrap, ~\$0)."
+            echo "deploy/tier is unchanged — set it to \`none\` before your next infra push to stay down."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+          total=$((clusters + instances + karp + lbs + nats + vpcs))
+          if [ "$total" -ne 0 ]; then
+            echo "::error title=Infrastructure still present::$total billable resource(s) remain — see the report."
+            exit 1
+          fi
+          echo "All clear: nothing left billing."
+
+  refused:
+    if: inputs.confirm != 'destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "::error::Confirmation must be exactly \"destroy\" — nothing was touched."
+          exit 1

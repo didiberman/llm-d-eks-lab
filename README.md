@@ -56,8 +56,11 @@ make deploy TIER=sim
 # Point kubectl at the cluster:
 make kubeconfig
 
-# Stop paying for GPUs:
+# Stop paying for GPUs (cluster stays up, ~$0.26/hr):
 echo none > deploy/tier && git commit -am "Stop" && git push
+
+# Tear down everything billable (CI, asks you to type "destroy"):
+make destroy        # or Actions → destroy → Run workflow
 ```
 
 The deploy run's summary page prints the model endpoint and the Open WebUI URL.
@@ -231,6 +234,11 @@ analysis from the 8-vCPU-spot era lives in [`docs/COSTS.md`](docs/COSTS.md).
   its last model pod leaves.
 - **NodePool vCPU limits** match the quota, so an over-ask shows up as a
   Pending pod rather than a stream of EC2 errors.
+- **Destroy on demand** (`.github/workflows/destroy.yml`) — manual workflow
+  that tears down the inference layer, waits for NLBs and GPU nodes to go,
+  destroys the cluster, sweeps orphaned Karpenter instances and fails if
+  anything billable remains. Leaves only the S3 state bucket and OIDC roles.
+  Set `deploy/tier` to `none` first, or the next infra push rebuilds it.
 - **AWS Budget + email** — set the `BUDGET_ALERT_EMAIL` secret to enable.
 - **IP allowlist** on both public endpoints (`ALLOWED_CIDRS`).
 - **Tagging** — every resource carries `Project=llm-d-eks-lab`.
@@ -462,7 +470,7 @@ terraform/
 manifests/router/       llm-d router values (shared by every tier)
 manifests/sim/, local/  the free kind tier
 loadgen/                k6 ramp script for `make load`
-.github/workflows/      deploy · reaper · validate
+.github/workflows/      deploy · destroy · reaper · validate
 docs/COSTS.md           shape/price analysis
 ```
 
@@ -476,6 +484,7 @@ cluster rebuild.
 
 ```
 make deploy TIER=...  run the deploy workflow in CI and follow it
+make destroy          run the destroy workflow in CI: everything billable, to ~$0
 make kubeconfig       point kubectl at the cluster (context: llm-d-eks-lab)
 make watch            live view of ScaledObject, HPA, pods and nodes
 make load             fire k6 at the endpoint and watch replicas scale
