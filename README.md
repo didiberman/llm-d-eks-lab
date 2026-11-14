@@ -620,6 +620,42 @@ Things the first real deploy surfaced that `terraform validate` could not:
 - **Ephemeral by design.** No persistent volumes: Open WebUI chats and
   downloaded weights vanish with their pods.
 
+## Known gaps
+
+What is proven and what is not, as of 2026-11-14.
+
+**Proven**
+
+- The whole GitOps stack on a local kind cluster, built from `main`: every Argo CD app Synced and Healthy, a completion through the router, a chat through Open WebUI, `tier: none` pruning everything in about 45 seconds, and the tier coming back in about 20.
+- The same workloads on real EKS when Terraform applied them (before the move to Argo CD): Kimi-Dev-72B on two GPUs, Karpenter launching the node, tool calling accepted, and the destroy workflow removing the cluster and VPC.
+- Every chart, for every tier and environment, passes strict schema validation in CI.
+
+**Not yet run on real AWS** (all gated behind `cluster: false`, so nothing spends money until you run `make cluster-on`)
+
+1. Terraform applying `argocd.tf`: the Argo CD install, the root Application, the HuggingFace Secret and the `kubectl` provider.
+2. Karpenter launching a node from the Argo-deployed NodePool and EC2NodeClass. The Terraform versions of these objects ran on EKS; the Helm-rendered ones have only been schema-checked.
+3. NLB source ranges on the Argo-rendered Services, fed from the `ALLOWED_CIDRS` secret through the root app.
+4. CI's verify job (wait for Argo CD, smoke test over a port-forward, `tier: none` check) and the cluster job with its new inputs. Only the scope job has run for real.
+5. The destroy workflow's new first step (delete the root app and let it cascade to NodePools and NLBs). The previous Terraform-based version, including the leaked-network-interface cleanup, is the one that was proven.
+6. `tier: none` on EKS. Proven on kind; EKS adds Karpenter node termination and NLB deletion timing.
+
+**Cheapest way to close all six** (about $0.20): `make cluster-on` (about 20 minutes, ~$0.26/hr), `make tier TIER=sim` (adds ~$0.03/hr), check `make apps`, then `make tier TIER=none`, then `make cluster-off && make destroy`.
+
+**Design risks to know about**
+
+- **Nothing switches GPUs off automatically.** The nightly reaper was removed on purpose. A forgotten `kimi` tier costs about $200 a day; the budget alert is optional and lags by about a day. End sessions with `make tier TIER=none` or `make destroy`.
+- **Whoever can push to `main` controls the cluster.** Argo CD auto-syncs `main` with prune and self-heal, and the deploy role is AdministratorAccess. Branch protection blocks force-pushes and deletion but does not require reviews.
+- **The repo has to stay public.** Argo CD reads it without credentials. A fork must change `repoURL` in `gitops/root/values.yaml` and `gitops_repo_url` in `terraform/10-cluster/variables.tf`.
+- **Cost figures are estimates** from list prices and instance runtimes. Cost Explorer lags about a day, and the `Project` cost-allocation tag was only activated on 2026-11-14, so `make cost` has no history before that.
+- **The local kind proof was only run on an arm64 Mac.** Registries such as ghcr.io can be slow from a laptop, which is why `local/kind-prepull.sh` exists.
+
+**Housekeeping**
+
+- `20-inference/terraform.tfstate` is an obsolete state object left in the S3 state bucket by the removed Terraform layer. It is harmless and can be deleted.
+- The remote `gitops` branch is fully merged into `main` and can be deleted.
+
+---
+
 ## License
 
 Apache-2.0
